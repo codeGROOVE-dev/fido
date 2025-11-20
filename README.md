@@ -1,6 +1,6 @@
 # bdcache - Big Dumb Cache
 
-<img src="media/logo-small.png" alt="bdcache logo" width="256" align="right">
+<img src="media/logo-small.png" alt="bdcache logo" width="256">
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/codeGROOVE-dev/bdcache.svg)](https://pkg.go.dev/github.com/codeGROOVE-dev/bdcache)
 [![Go Report Card](https://goreportcard.com/badge/github.com/codeGROOVE-dev/bdcache)](https://goreportcard.com/report/github.com/codeGROOVE-dev/bdcache)
@@ -22,10 +22,10 @@ go get github.com/codeGROOVE-dev/bdcache
 // Memory only
 cache, err := bdcache.New[string, int](ctx)
 if err != nil {
-    panic(err)
+    return err
 }
 if err := cache.Set(ctx, "answer", 42, 0); err != nil {
-    panic(err)
+    return err
 }
 val, found, err := cache.Get(ctx, "answer")
 
@@ -71,9 +71,9 @@ Benchmarks on MacBook Pro M4 Max comparing memory-only Get operations:
 Independent benchmark using [scalalang2/go-cache-benchmark](https://github.com/scalalang2/go-cache-benchmark) (500K items, Zipfian distribution):
 
 **Hit Rate Leadership:**
+- **0.1% cache size**: bdcache **48.12%** vs SIEVE 47.42%, TinyLFU 47.37%, S3-FIFO 47.16%
 - **1% cache size**: bdcache **64.45%** vs TinyLFU 63.94%, Otter 63.60%, S3-FIFO 63.59%, SIEVE 63.33%
 - **10% cache size**: bdcache **80.39%** vs TinyLFU 80.43%, Otter 79.86%, S3-FIFO 79.84%
-- **0.1% cache size**: bdcache **48.12%** vs SIEVE 47.42%, TinyLFU 47.37%, S3-FIFO 47.16%
 
 Consistently ranks top 1-2 for hit rate across all cache sizes while maintaining competitive throughput (5-12M QPS). The S3-FIFO implementation prioritizes cache efficiency over raw speed, making bdcache ideal when hit rate matters.
 
