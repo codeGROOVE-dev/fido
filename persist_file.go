@@ -44,7 +44,7 @@ type filePersist[K comparable, V any] struct {
 // ValidateKey checks if a key is valid for file persistence.
 // Keys must be alphanumeric, dash, underscore, period, or colon, and max 127 characters.
 //
-//nolint:revive // confusing-naming - implements PersistenceLayer interface
+
 func (*filePersist[K, V]) ValidateKey(key K) error {
 	keyStr := fmt.Sprintf("%v", key)
 	if len(keyStr) > maxKeyLength {
@@ -164,7 +164,7 @@ func (f *filePersist[K, V]) Load(ctx context.Context, key K) (value V, expiry ti
 
 // Store saves a value to a file.
 //
-//nolint:revive // confusing-naming - implements PersistenceLayer interface
+
 func (f *filePersist[K, V]) Store(ctx context.Context, key K, value V, expiry time.Time) error {
 	filename := filepath.Join(f.dir, f.keyToFilename(key))
 	subdir := filepath.Dir(filename)
@@ -175,13 +175,18 @@ func (f *filePersist[K, V]) Store(ctx context.Context, key K, value V, expiry ti
 	f.subdirsMu.RUnlock()
 
 	if !exists {
-		// Create subdirectory if needed
-		if err := os.MkdirAll(subdir, 0o750); err != nil {
-			return fmt.Errorf("create subdirectory: %w", err)
-		}
-		// Cache that we created it
+		// Hold write lock during check-and-create to avoid race
 		f.subdirsMu.Lock()
-		f.subdirsMade[subdir] = true
+		// Double-check after acquiring write lock
+		if !f.subdirsMade[subdir] {
+			// Create subdirectory if needed (MkdirAll is idempotent)
+			if err := os.MkdirAll(subdir, 0o750); err != nil {
+				f.subdirsMu.Unlock()
+				return fmt.Errorf("create subdirectory: %w", err)
+			}
+			// Cache that we created it
+			f.subdirsMade[subdir] = true
+		}
 		f.subdirsMu.Unlock()
 	}
 
@@ -244,7 +249,7 @@ func (f *filePersist[K, V]) Store(ctx context.Context, key K, value V, expiry ti
 
 // Delete removes a file.
 //
-//nolint:revive // confusing-naming - implements PersistenceLayer interface
+
 func (f *filePersist[K, V]) Delete(ctx context.Context, key K) error {
 	filename := filepath.Join(f.dir, f.keyToFilename(key))
 	err := os.Remove(filename)
@@ -256,7 +261,7 @@ func (f *filePersist[K, V]) Delete(ctx context.Context, key K) error {
 
 // LoadRecent streams entries from files, returning up to 'limit' most recently updated entries.
 //
-//nolint:revive,gocritic // confusing-naming - implements PersistenceLayer interface; unnamedResult - channel returns are self-documenting
+//nolint:gocritic // unnamedResult - channel returns are self-documenting
 func (f *filePersist[K, V]) LoadRecent(ctx context.Context, limit int) (<-chan Entry[K, V], <-chan error) {
 	entryCh := make(chan Entry[K, V], 100)
 	errCh := make(chan error, 1)
@@ -360,7 +365,7 @@ func (f *filePersist[K, V]) LoadRecent(ctx context.Context, limit int) (<-chan E
 
 // LoadAll streams all entries from files (no limit).
 //
-//nolint:revive,gocritic // confusing-naming - implements PersistenceLayer interface; unnamedResult - channel returns are self-documenting
+//nolint:gocritic // unnamedResult - channel returns are self-documenting
 func (f *filePersist[K, V]) LoadAll(ctx context.Context) (<-chan Entry[K, V], <-chan error) {
 	return f.LoadRecent(ctx, 0)
 }
@@ -368,7 +373,7 @@ func (f *filePersist[K, V]) LoadAll(ctx context.Context) (<-chan Entry[K, V], <-
 // Cleanup removes expired entries from file storage.
 // Walks through all cache files and deletes those with expired timestamps.
 //
-//nolint:revive // confusing-naming - implements PersistenceLayer interface
+
 func (f *filePersist[K, V]) Cleanup(ctx context.Context, maxAge time.Duration) (int, error) {
 	cutoff := time.Now().Add(-maxAge)
 	deleted := 0
@@ -435,7 +440,7 @@ func (f *filePersist[K, V]) Cleanup(ctx context.Context, maxAge time.Duration) (
 
 // Close cleans up resources.
 //
-//nolint:revive // confusing-naming - implements PersistenceLayer interface
+
 func (*filePersist[K, V]) Close() error {
 	// No resources to clean up for file-based persistence
 	return nil

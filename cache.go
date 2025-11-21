@@ -171,9 +171,40 @@ func (c *Cache[K, V]) Set(ctx context.Context, key K, value V, ttl time.Duration
 	return nil
 }
 
+// SetAsync adds or updates a value in the cache with optional TTL, handling persistence asynchronously.
+// Key validation and in-memory caching happen synchronously. Persistence errors are logged but not returned.
+// Returns an error only for validation failures (e.g., invalid key format).
+func (c *Cache[K, V]) SetAsync(ctx context.Context, key K, value V, ttl time.Duration) error {
+	var expiry time.Time
+	if ttl > 0 {
+		expiry = time.Now().Add(ttl)
+	} else if c.opts.DefaultTTL > 0 {
+		expiry = time.Now().Add(c.opts.DefaultTTL)
+	}
+
+	// Validate key early if persistence is enabled (synchronous)
+	if c.persist != nil {
+		if err := c.persist.ValidateKey(key); err != nil {
+			return err
+		}
+	}
+
+	// ALWAYS update memory first - reliability guarantee (synchronous)
+	c.memory.setToMemory(key, value, expiry)
+
+	// Update persistence asynchronously if available
+	if c.persist != nil {
+		go func() {
+			if err := c.persist.Store(ctx, key, value, expiry); err != nil {
+				slog.Warn("async persistence store failed", "error", err, "key", key)
+			}
+		}()
+	}
+
+	return nil
+}
+
 // Delete removes a value from the cache.
-//
-//nolint:revive // confusing-naming - standard cache operation
 func (c *Cache[K, V]) Delete(ctx context.Context, key K) {
 	// Remove from memory
 	c.memory.deleteFromMemory(key)
@@ -194,8 +225,6 @@ func (c *Cache[K, V]) Delete(ctx context.Context, key K) {
 
 // Cleanup removes expired entries from the cache.
 // Returns the number of entries removed.
-//
-//nolint:revive // confusing-naming - standard cache operation
 func (c *Cache[K, V]) Cleanup() int {
 	return c.memory.cleanupMemory()
 }
@@ -206,8 +235,6 @@ func (c *Cache[K, V]) Len() int {
 }
 
 // Close releases resources held by the cache.
-//
-//nolint:revive // confusing-naming - standard cache operation
 func (c *Cache[K, V]) Close() error {
 	if c.persist != nil {
 		if err := c.persist.Close(); err != nil {

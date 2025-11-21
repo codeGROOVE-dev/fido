@@ -186,6 +186,8 @@ linters:
           arguments: [10]
         - name: flag-parameter # fixes are difficult
           disabled: true
+        - name: confusing-naming # false positives
+          disabled: true
 
     rowserrcheck:
       # database/sql is always checked.

@@ -24,9 +24,8 @@ cache, err := bdcache.New[string, int](ctx)
 if err != nil {
     return err
 }
-if err := cache.Set(ctx, "answer", 42, 0); err != nil {
-    return err
-}
+cache.Set(ctx, "answer", 42, 0)           // Synchronous: returns after persistence completes
+cache.SetAsync(ctx, "answer", 42, 0)      // Async: returns immediately, persists in background
 val, found, err := cache.Get(ctx, "answer")
 
 // With smart persistence (local files for dev, Google Cloud Datastore for Cloud Run)

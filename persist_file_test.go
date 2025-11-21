@@ -332,3 +332,186 @@ func TestFilePersist_Store_CompleteFlow(t *testing.T) {
 		t.Errorf("expiry = %v; want ~%v", loadedExpiry, expiry)
 	}
 }
+
+func TestCache_Set_StressTest_10000Items(t *testing.T) {
+	ctx := context.Background()
+	cacheID := fmt.Sprintf("test-set-stress-%d", time.Now().Unix())
+
+	cache, err := New[int, string](ctx, WithLocalStore(cacheID))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() {
+		if err := cache.Close(); err != nil {
+			t.Logf("Close error: %v", err)
+		}
+		if baseDir, err := os.UserCacheDir(); err == nil {
+			if err := os.RemoveAll(baseDir + "/" + cacheID); err != nil {
+				t.Logf("Failed to clean up test dir: %v", err)
+			}
+		}
+	}()
+
+	// Write 10,000 items synchronously
+	const count = 10000
+	startWrite := time.Now()
+	for i := range count {
+		if err := cache.Set(ctx, i, fmt.Sprintf("value-%d", i), 0); err != nil {
+			t.Fatalf("Set[%d]: %v", i, err)
+		}
+	}
+	writeTime := time.Since(startWrite)
+	t.Logf("Wrote %d items synchronously in %v (%.2f items/sec)", count, writeTime, float64(count)/writeTime.Seconds())
+
+	// All should be immediately available in memory
+	for i := range count {
+		val, found, err := cache.Get(ctx, i)
+		if err != nil {
+			t.Fatalf("Get[%d]: %v", i, err)
+		}
+		if !found {
+			t.Errorf("expected key %d to be in memory immediately", i)
+		}
+		expected := fmt.Sprintf("value-%d", i)
+		if val != expected {
+			t.Errorf("key %d: expected %s, got %s", i, expected, val)
+		}
+	}
+	t.Logf("All %d items verified in memory", count)
+
+	// Create new cache instance to verify persistence (should be immediate with Set)
+	cache2, err := New[int, string](ctx, WithLocalStore(cacheID))
+	if err != nil {
+		t.Fatalf("New second cache: %v", err)
+	}
+	defer func() {
+		if err := cache2.Close(); err != nil {
+			t.Logf("Close error: %v", err)
+		}
+	}()
+
+	// Check a statistically significant sample (100 random items)
+	persistedCount := 0
+	sampleSize := 100
+	for i := range sampleSize {
+		key := i * (count / sampleSize) // Evenly distributed sample
+		val, found, err := cache2.Get(ctx, key)
+		if err != nil {
+			t.Fatalf("Get[%d] from second cache: %v", key, err)
+		}
+		if found {
+			persistedCount++
+			expected := fmt.Sprintf("value-%d", key)
+			if val != expected {
+				t.Errorf("key %d: expected %s, got %s", key, expected, val)
+			}
+		}
+	}
+
+	persistRatio := float64(persistedCount) / float64(sampleSize)
+	t.Logf("Persistence success rate: %d/%d (%.1f%%)", persistedCount, sampleSize, persistRatio*100)
+
+	// We expect 100% of items to be persisted with synchronous Set
+	if persistRatio < 1.0 {
+		t.Errorf("expected 100%% persistence success with synchronous Set, got %.1f%%", persistRatio*100)
+	}
+}
+
+func TestCache_SetAsync_StressTest_10000Items(t *testing.T) {
+	ctx := context.Background()
+	cacheID := fmt.Sprintf("test-setasync-stress-%d", time.Now().Unix())
+
+	cache, err := New[int, string](ctx, WithLocalStore(cacheID))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	cacheClosed := false
+	defer func() {
+		if !cacheClosed {
+			if err := cache.Close(); err != nil {
+				t.Logf("Close error: %v", err)
+			}
+		}
+		if baseDir, err := os.UserCacheDir(); err == nil {
+			if err := os.RemoveAll(baseDir + "/" + cacheID); err != nil {
+				t.Logf("Failed to clean up test dir: %v", err)
+			}
+		}
+	}()
+
+	// Write 10,000 items asynchronously in rapid succession
+	const count = 10000
+	startWrite := time.Now()
+	for i := range count {
+		if err := cache.SetAsync(ctx, i, fmt.Sprintf("value-%d", i), 0); err != nil {
+			t.Fatalf("SetAsync[%d]: %v", i, err)
+		}
+	}
+	writeTime := time.Since(startWrite)
+	t.Logf("Wrote %d items in %v (%.2f items/sec)", count, writeTime, float64(count)/writeTime.Seconds())
+
+	// All should be immediately available in memory
+	for i := range count {
+		val, found, err := cache.Get(ctx, i)
+		if err != nil {
+			t.Fatalf("Get[%d]: %v", i, err)
+		}
+		if !found {
+			t.Errorf("expected key %d to be in memory immediately", i)
+		}
+		expected := fmt.Sprintf("value-%d", i)
+		if val != expected {
+			t.Errorf("key %d: expected %s, got %s", i, expected, val)
+		}
+	}
+	t.Logf("All %d items verified in memory", count)
+
+	// Close the first cache to ensure all async operations complete
+	if err := cache.Close(); err != nil {
+		t.Fatalf("Close first cache: %v", err)
+	}
+	cacheClosed = true
+
+	// Wait for async goroutines to complete
+	// Based on sync Set performance (~1.15s for 10k items), wait 3x that time for safety
+	// This accounts for system contention when running full test suite
+	t.Log("Waiting for async goroutines to complete...")
+	time.Sleep(9 * time.Second)
+
+	// Create new cache instance to verify persistence
+	cache2, err := New[int, string](ctx, WithLocalStore(cacheID))
+	if err != nil {
+		t.Fatalf("New second cache: %v", err)
+	}
+	defer func() {
+		if err := cache2.Close(); err != nil {
+			t.Logf("Close error: %v", err)
+		}
+	}()
+
+	// Check a statistically significant sample (100 random items)
+	persistedCount := 0
+	sampleSize := 100
+	for i := range sampleSize {
+		key := i * (count / sampleSize) // Evenly distributed sample
+		val, found, err := cache2.Get(ctx, key)
+		if err != nil {
+			t.Fatalf("Get[%d] from second cache: %v", key, err)
+		}
+		if found {
+			persistedCount++
+			expected := fmt.Sprintf("value-%d", key)
+			if val != expected {
+				t.Errorf("key %d: expected %s, got %s", key, expected, val)
+			}
+		}
+	}
+
+	persistRatio := float64(persistedCount) / float64(sampleSize)
+	t.Logf("Persistence success rate: %d/%d (%.1f%%)", persistedCount, sampleSize, persistRatio*100)
+
+	// We expect at least 95% of items to be persisted
+	if persistRatio < 0.95 {
+		t.Errorf("expected at least 95%% persistence success, got %.1f%%", persistRatio*100)
+	}
+}
