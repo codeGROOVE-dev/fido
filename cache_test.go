@@ -481,7 +481,7 @@ func TestCache_WithOptions(t *testing.T) {
 	if cache.opts.MemorySize != 500 {
 		t.Errorf("memory size = %d; want 500", cache.opts.MemorySize)
 	}
-	_ = cache.Close()
+	_ = cache.Close() //nolint:errcheck // Test cleanup
 
 	// Test WithDefaultTTL
 	cache, err = New[string, int](ctx, WithDefaultTTL(5*time.Minute))
@@ -491,7 +491,7 @@ func TestCache_WithOptions(t *testing.T) {
 	if cache.opts.DefaultTTL != 5*time.Minute {
 		t.Errorf("default TTL = %v; want 5m", cache.opts.DefaultTTL)
 	}
-	_ = cache.Close()
+	_ = cache.Close() //nolint:errcheck // Test cleanup
 
 	// Test WithWarmup
 	cache, err = New[string, int](ctx, WithWarmup(100))
@@ -501,7 +501,7 @@ func TestCache_WithOptions(t *testing.T) {
 	if cache.opts.WarmupLimit != 100 {
 		t.Errorf("warmup limit = %d; want 100", cache.opts.WarmupLimit)
 	}
-	_ = cache.Close()
+	_ = cache.Close() //nolint:errcheck // Test cleanup
 
 	// Test WithCleanup
 	cache, err = New[string, int](ctx, WithCleanup(1*time.Hour))
@@ -514,7 +514,7 @@ func TestCache_WithOptions(t *testing.T) {
 	if cache.opts.CleanupMaxAge != 1*time.Hour {
 		t.Errorf("cleanup max age = %v; want 1h", cache.opts.CleanupMaxAge)
 	}
-	_ = cache.Close()
+	_ = cache.Close() //nolint:errcheck // Test cleanup
 }
 
 func TestCache_DeleteNonExistent(t *testing.T) {
@@ -523,7 +523,7 @@ func TestCache_DeleteNonExistent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer func() { _ = cache.Close() }()
+	defer func() { _ = cache.Close() }() //nolint:errcheck // Test cleanup
 
 	// Delete non-existent key should not error
 	cache.Delete(ctx, "does-not-exist")
@@ -548,19 +548,19 @@ func TestCache_EvictFromMain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer func() { _ = cache.Close() }()
+	defer func() { _ = cache.Close() }() //nolint:errcheck // Test cleanup
 
 	// Fill small queue and promote items to main by accessing them twice
 	for i := range 15 {
-		_ = cache.Set(ctx, i, i, 0)
+		_ = cache.Set(ctx, i, i, 0) //nolint:errcheck // Test fixture
 		// Access immediately to promote to main
-		_, _, _ = cache.Get(ctx, i)
+		_, _, _ = cache.Get(ctx, i) //nolint:errcheck // Exercising code path
 	}
 
 	// Add more items to force eviction from main queue
 	for i := range 10 {
-		_ = cache.Set(ctx, i+100, i+100, 0)
-		_, _, _ = cache.Get(ctx, i+100)
+		_ = cache.Set(ctx, i+100, i+100, 0) //nolint:errcheck // Test fixture
+		_, _, _ = cache.Get(ctx, i+100)     //nolint:errcheck // Exercising code path
 	}
 
 	// Cache should not exceed capacity
@@ -575,7 +575,7 @@ func TestCache_GetExpired(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer func() { _ = cache.Close() }()
+	defer func() { _ = cache.Close() }() //nolint:errcheck // Test cleanup
 
 	// Set with very short TTL
 	if err := cache.Set(ctx, "key1", 42, 1*time.Millisecond); err != nil {
@@ -601,7 +601,7 @@ func TestCache_SetUpdateExisting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer func() { _ = cache.Close() }()
+	defer func() { _ = cache.Close() }() //nolint:errcheck // Test cleanup
 
 	// Set initial value
 	if err := cache.Set(ctx, "key1", 42, 0); err != nil {

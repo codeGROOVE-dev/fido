@@ -13,10 +13,10 @@ func TestNew_LocalFallback(t *testing.T) {
 
 	// Ensure K_SERVICE is not set
 	oldVal := os.Getenv("K_SERVICE")
-	_ = os.Unsetenv("K_SERVICE")
+	_ = os.Unsetenv("K_SERVICE") //nolint:errcheck // Test setup
 	defer func() {
 		if oldVal != "" {
-			_ = os.Setenv("K_SERVICE", oldVal)
+			_ = os.Setenv("K_SERVICE", oldVal) //nolint:errcheck,usetesting // Test cleanup
 		}
 	}()
 
@@ -42,12 +42,12 @@ func TestNew_CloudRunWithoutDatastore(t *testing.T) {
 
 	// Set K_SERVICE to simulate Cloud Run
 	oldVal := os.Getenv("K_SERVICE")
-	_ = os.Setenv("K_SERVICE", "test-service")
+	_ = os.Setenv("K_SERVICE", "test-service") //nolint:errcheck,usetesting // Test setup
 	defer func() {
 		if oldVal != "" {
-			_ = os.Setenv("K_SERVICE", oldVal)
+			_ = os.Setenv("K_SERVICE", oldVal) //nolint:errcheck,usetesting // Test cleanup
 		} else {
-			_ = os.Unsetenv("K_SERVICE")
+			_ = os.Unsetenv("K_SERVICE") //nolint:errcheck // Test setup
 		}
 	}()
 
@@ -108,10 +108,10 @@ func TestNew_DetectsCloudRun(t *testing.T) {
 
 	// Unset K_SERVICE to test non-Cloud Run path
 	oldVal := os.Getenv("K_SERVICE")
-	_ = os.Unsetenv("K_SERVICE")
+	_ = os.Unsetenv("K_SERVICE") //nolint:errcheck // Test setup
 	defer func() {
 		if oldVal != "" {
-			_ = os.Setenv("K_SERVICE", oldVal)
+			_ = os.Setenv("K_SERVICE", oldVal) //nolint:errcheck,usetesting // Test cleanup
 		}
 	}()
 
@@ -221,12 +221,12 @@ func TestNew_CloudRunFallbackWithDelete(t *testing.T) {
 
 	// Set K_SERVICE to simulate Cloud Run
 	oldVal := os.Getenv("K_SERVICE")
-	_ = os.Setenv("K_SERVICE", "test-service-delete")
+	_ = os.Setenv("K_SERVICE", "test-service-delete") //nolint:errcheck,usetesting // Test setup
 	defer func() {
 		if oldVal != "" {
-			_ = os.Setenv("K_SERVICE", oldVal)
+			_ = os.Setenv("K_SERVICE", oldVal) //nolint:errcheck,usetesting // Test cleanup
 		} else {
-			_ = os.Unsetenv("K_SERVICE")
+			_ = os.Unsetenv("K_SERVICE") //nolint:errcheck // Test setup
 		}
 	}()
 

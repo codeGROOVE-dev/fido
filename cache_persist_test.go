@@ -86,6 +86,7 @@ func (m *mockPersister[K, V]) Delete(ctx context.Context, key K) error {
 	return nil
 }
 
+//nolint:gocritic // Channel returns are clearer without named results
 func (m *mockPersister[K, V]) LoadRecent(ctx context.Context, limit int) (<-chan Entry[K, V], <-chan error) {
 	entryCh := make(chan Entry[K, V], 10)
 	errCh := make(chan error, 1)
@@ -166,7 +167,7 @@ func TestCache_WithPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer func() { _ = cache.Close() }()
+	defer func() { _ = cache.Close() }() //nolint:errcheck // Test cleanup
 
 	// Set should persist
 	if err := cache.Set(ctx, "key1", 42, 0); err != nil {
@@ -202,13 +203,13 @@ func TestCache_GetFromPersistence(t *testing.T) {
 	persister := newMockPersister[string, int]()
 
 	// Pre-populate persistence
-	_ = persister.Store(ctx, "key1", 42, time.Time{})
+	_ = persister.Store(ctx, "key1", 42, time.Time{}) //nolint:errcheck // Test fixture
 
 	cache, err := New[string, int](ctx, WithPersistence(persister))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer func() { _ = cache.Close() }()
+	defer func() { _ = cache.Close() }() //nolint:errcheck // Test cleanup
 
 	// Get should load from persistence
 	val, found, err := cache.Get(ctx, "key1")
@@ -228,13 +229,13 @@ func TestCache_GetFromPersistenceExpired(t *testing.T) {
 	persister := newMockPersister[string, int]()
 
 	// Pre-populate with expired entry
-	_ = persister.Store(ctx, "key1", 42, time.Now().Add(-1*time.Hour))
+	_ = persister.Store(ctx, "key1", 42, time.Now().Add(-1*time.Hour)) //nolint:errcheck // Test fixture
 
 	cache, err := New[string, int](ctx, WithPersistence(persister))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer func() { _ = cache.Close() }()
+	defer func() { _ = cache.Close() }() //nolint:errcheck // Test cleanup
 
 	// Get should return not found for expired entry
 	_, found, err := cache.Get(ctx, "key1")
@@ -252,7 +253,7 @@ func TestCache_WithWarmup(t *testing.T) {
 
 	// Pre-populate persistence with 10 items
 	for i := range 10 {
-		_ = persister.Store(ctx, fmt.Sprintf("key%d", i), i, time.Time{})
+		_ = persister.Store(ctx, fmt.Sprintf("key%d", i), i, time.Time{}) //nolint:errcheck // Test fixture
 	}
 
 	// Create cache with warmup limit of 5
@@ -262,7 +263,7 @@ func TestCache_WithWarmup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer func() { _ = cache.Close() }()
+	defer func() { _ = cache.Close() }() //nolint:errcheck // Test cleanup
 
 	// Give warmup goroutine time to complete
 	time.Sleep(100 * time.Millisecond)
@@ -282,9 +283,9 @@ func TestCache_WithCleanupOnStartup(t *testing.T) {
 
 	// Pre-populate with expired entries
 	past := time.Now().Add(-2 * time.Hour)
-	_ = persister.Store(ctx, "expired1", 1, past)
-	_ = persister.Store(ctx, "expired2", 2, past)
-	_ = persister.Store(ctx, "valid", 3, time.Time{})
+	_ = persister.Store(ctx, "expired1", 1, past)     //nolint:errcheck // Test fixture
+	_ = persister.Store(ctx, "expired2", 2, past)     //nolint:errcheck // Test fixture
+	_ = persister.Store(ctx, "valid", 3, time.Time{}) //nolint:errcheck // Test fixture
 
 	// Create cache with cleanup
 	cache, err := New[string, int](ctx,
@@ -293,7 +294,7 @@ func TestCache_WithCleanupOnStartup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer func() { _ = cache.Close() }()
+	defer func() { _ = cache.Close() }() //nolint:errcheck // Test cleanup
 
 	// Expired entries should be cleaned up
 	_, _, found, err := persister.Load(ctx, "expired1")
@@ -322,7 +323,7 @@ func TestCache_SetAsyncWithPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer func() { _ = cache.Close() }()
+	defer func() { _ = cache.Close() }() //nolint:errcheck // Test cleanup
 
 	// SetAsync should not block but value should be available immediately
 	if err := cache.SetAsync(ctx, "key1", 42, 0); err != nil {
@@ -378,7 +379,7 @@ func TestCache_PersistenceErrors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer func() { _ = cache.Close() }()
+	defer func() { _ = cache.Close() }() //nolint:errcheck // Test cleanup
 
 	// Set returns error when persistence fails (by design)
 	// Value is still in memory, but error is returned to caller
@@ -434,7 +435,7 @@ func TestCache_Delete_Errors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer func() { _ = cache.Close() }()
+	defer func() { _ = cache.Close() }() //nolint:errcheck // Test cleanup
 
 	// Store a value (with failSet = false)
 	persister.failSet = false
@@ -483,7 +484,7 @@ func TestCache_Get_InvalidKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer func() { _ = cache.Close() }()
+	defer func() { _ = cache.Close() }() //nolint:errcheck // Test cleanup
 
 	// Get with empty key (invalid)
 	_, found, err := cache.Get(ctx, "")
@@ -503,10 +504,10 @@ func TestCache_Get_PersistenceLoadError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer func() { _ = cache.Close() }()
+	defer func() { _ = cache.Close() }() //nolint:errcheck // Test cleanup
 
 	// Pre-populate persistence (not in memory)
-	_ = persister.Store(ctx, "key1", 42, time.Time{})
+	_ = persister.Store(ctx, "key1", 42, time.Time{}) //nolint:errcheck // Test fixture
 
 	// Make persistence Load fail
 	persister.failGet = true
@@ -548,7 +549,7 @@ func TestCache_GhostQueue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer func() { _ = cache.Close() }()
+	defer func() { _ = cache.Close() }() //nolint:errcheck // Test cleanup
 
 	// Fill small queue (10% of 10 = 1)
 	// Insert items to trigger ghost queue
@@ -560,7 +561,7 @@ func TestCache_GhostQueue(t *testing.T) {
 
 	// Access some items to create hot items
 	for i := range 5 {
-		_, _, _ = cache.Get(ctx, fmt.Sprintf("key%d", i))
+		_, _, _ = cache.Get(ctx, fmt.Sprintf("key%d", i)) //nolint:errcheck // Exercising code path
 	}
 
 	// Insert more to trigger evictions from small queue to ghost queue
@@ -582,7 +583,7 @@ func TestCache_MainQueueEviction(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer func() { _ = cache.Close() }()
+	defer func() { _ = cache.Close() }() //nolint:errcheck // Test cleanup
 
 	// Insert and access items to get them into Main queue
 	for i := range 15 {
@@ -591,7 +592,7 @@ func TestCache_MainQueueEviction(t *testing.T) {
 			t.Fatalf("Set: %v", err)
 		}
 		// Access to promote to Main
-		_, _, _ = cache.Get(ctx, key)
+		_, _, _ = cache.Get(ctx, key) //nolint:errcheck // Exercising code path
 	}
 
 	// Insert more items to trigger eviction from Main queue
@@ -600,7 +601,7 @@ func TestCache_MainQueueEviction(t *testing.T) {
 		if err := cache.Set(ctx, key, i+15, 0); err != nil {
 			t.Fatalf("Set: %v", err)
 		}
-		_, _, _ = cache.Get(ctx, key)
+		_, _, _ = cache.Get(ctx, key) //nolint:errcheck // Exercising code path
 	}
 
 	// Verify cache is at capacity
@@ -616,13 +617,13 @@ func TestCache_CleanupExpiredEntries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer func() { _ = cache.Close() }()
+	defer func() { _ = cache.Close() }() //nolint:errcheck // Test cleanup
 
 	// Store items with expiry
 	past := time.Now().Add(-1 * time.Hour)
-	_ = cache.Set(ctx, "expired1", 1, -1*time.Hour) // Already expired
-	_ = cache.Set(ctx, "expired2", 2, -1*time.Hour)
-	_ = cache.Set(ctx, "valid", 3, 1*time.Hour)
+	_ = cache.Set(ctx, "expired1", 1, -1*time.Hour) //nolint:errcheck // Test fixture
+	_ = cache.Set(ctx, "expired2", 2, -1*time.Hour) //nolint:errcheck // Test fixture
+	_ = cache.Set(ctx, "valid", 3, 1*time.Hour)     //nolint:errcheck // Test fixture
 
 	// Manually set expiry to past for testing
 	if err := cache.Set(ctx, "test-expired", 99, 0); err != nil {

@@ -381,7 +381,7 @@ func TestFilePersist_ValidateKey(t *testing.T) {
 		{"key at max length", string(validMaxKey), false},
 		{"key too long", string(make([]byte, 128)), true},
 		{"key with space", "my key", true},
-		{"key with unicode", "key-日本語", true},
+		{"key with unicode", "key-日本語", true}, //nolint:gosmopolitan // Testing unicode handling
 		{"key with slash", "key/123", true},
 	}
 
@@ -722,9 +722,7 @@ func TestFilePersist_New_UseDefaultCacheDir(t *testing.T) {
 			t.Logf("Close error: %v", err)
 		}
 		// Clean up the test directory from OS cache dir
-		if err := os.RemoveAll(fp.(*persister[string, int]).Dir); err != nil {
-			t.Logf("RemoveAll error: %v", err)
-		}
+		_ = os.RemoveAll(fp.(*persister[string, int]).Dir) //nolint:errcheck // Test cleanup
 	}()
 
 	ctx := context.Background()
