@@ -31,5 +31,8 @@ go.work.sum
 # .idea/
 # .vscode/
 
+*.rdb
+*.prof
+
 # added by lint-install
 out/

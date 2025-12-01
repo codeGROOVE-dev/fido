@@ -156,6 +156,12 @@ func (c *Cache[K, V]) calculateExpiry(ttl time.Duration) time.Time {
 // Returns an error if the key violates persistence constraints or if persistence fails.
 // Even when an error is returned, the value is cached in memory.
 func (c *Cache[K, V]) Set(ctx context.Context, key K, value V, ttl time.Duration) error {
+	// Fast path: no TTL, no persistence (common case)
+	if ttl == 0 && c.opts.DefaultTTL == 0 && c.persist == nil {
+		c.memory.setToMemory(key, value, time.Time{})
+		return nil
+	}
+
 	expiry := c.calculateExpiry(ttl)
 
 	// Validate key early if persistence is enabled

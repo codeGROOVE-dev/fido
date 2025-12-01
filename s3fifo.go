@@ -110,13 +110,14 @@ func (c *s3fifo[K, V]) getFromMemory(key K) (V, bool) {
 // setToMemory adds or updates a value in the in-memory cache.
 func (c *s3fifo[K, V]) setToMemory(key K, value V, expiry time.Time) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 
-	// Update existing entry
+	// Update existing entry (fast path - no defer overhead)
+	// Note: We don't increment freq here. S3-FIFO tracks read access frequency,
+	// not write frequency. Only Get increments freq.
 	if ent, ok := c.items[key]; ok {
 		ent.value = value
 		ent.expiry = expiry
-		ent.freq.Add(1)
+		c.mu.Unlock()
 		return
 	}
 
@@ -151,6 +152,7 @@ func (c *s3fifo[K, V]) setToMemory(key K, value V, expiry time.Time) {
 	}
 
 	c.items[key] = ent
+	c.mu.Unlock()
 }
 
 // deleteFromMemory removes a value from the in-memory cache.

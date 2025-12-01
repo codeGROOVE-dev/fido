@@ -60,38 +60,49 @@ cache, _ := bdcache.New[string, User](ctx,
 
 ## Performance
 
-### vs Popular Go Caches
+For performance, bdcache biases toward:
 
-Benchmarks on MacBook Pro M4 Max comparing memory-only Get operations:
+* the highest hit-rate in real-world workloads
+* the lowest CPU overhead for reads (high ns/op)
 
-| Library | Algorithm | ns/op | Persistence |
-|---------|-----------|-------|-------------|
-| **bdcache** | S3-FIFO | **8.61** | Yes |
-| golang-lru | LRU | 13.02 | ❌ None |
-| otter | S3-FIFO | 14.58 | ⚠️ Manual (Save/Load entire cache) |
-| ristretto | TinyLFU | 30.53 | ❌ None |
+### CPU Overhead
 
-> ⚠️ **Benchmark Disclaimer**: These benchmarks are highly cherrypicked to show S3-FIFO's advantages. Different cache implementations excel at different workloads - LRU may outperform S3-FIFO in some scenarios, while TinyLFU shines in others. Performance varies based on access patterns, working set size, and hardware.
->
-> **The real differentiator** is bdcache's automatic per-item persistence designed for unreliable environments like Cloud Run and Kubernetes, where shutdowns are unpredictable. See [benchmarks/](benchmarks/) for methodology.
+Benchmarks on MacBook Pro M4 Max comparing memory-only operations:
 
-**Key advantage:**
-- **Automatic persistence for unreliable environments** - per-item writes to local files or Google Cloud Datastore survive unexpected shutdowns (Cloud Run, Kubernetes), container restarts, and crashes without manual save/load choreography
+  | Operation | bdcache     | LRU         | ristretto   | otter       |
+  |-----------|-------------|-------------|-------------|-------------|
+  | Get       | 8.63 ns/op  | 14.03 ns/op | 30.24 ns/op | 15.25 ns/op |
+  | Set       | 14.03 ns/op | 13.94 ns/op | 96.24 ns/op | 141.3 ns/op |
 
-**Also competitive on:**
-- Speed - comparable to or faster than alternatives on typical workloads
-- Hit rates - S3-FIFO protects hot data from scans in specific scenarios
-- Zero allocations - efficient for high-frequency operations
-
-### Competitive Analysis
-
-Independent benchmark using [scalalang2/go-cache-benchmark](https://github.com/scalalang2/go-cache-benchmark) (500K items, Zipfian distribution) shows bdcache consistently ranks top 1-2 for hit rate across all cache sizes:
-
-- **0.1% cache size**: bdcache **48.12%** vs SIEVE 47.42%, TinyLFU 47.37%
-- **1% cache size**: bdcache **64.45%** vs TinyLFU 63.94%, Otter 63.60%
-- **10% cache size**: bdcache **80.39%** vs TinyLFU 80.43%, Otter 79.86%
+bdcache is faster than anyone else for Get operations, while still faster than most implementations for Set. 
 
 See [benchmarks/](benchmarks/) for detailed methodology and running instructions.
+
+## Hit Rates
+
+For hit rates, bdcache is competitive with otter & tinylfu, often nudging out both depending on the benchmark scenario. Here's an independent benchmark using [scalalang2/go-cache-benchmark](https://github.com/scalalang2/go-cache-benchmark):
+
+```
+itemSize=500000, workloads=7500000, cacheSize=1.00%, zipf's alpha=0.99, concurrency=16
+
+       CACHE      | HITRATE |   QPS    |  HITS   | MISSES
+------------------+---------+----------+---------+----------
+  bdcache         | 64.45%  |  5572065 | 4833482 | 2666518
+  tinylfu         | 63.94%  |  2357008 | 4795685 | 2704315
+  s3-fifo         | 63.57%  |  2899111 | 4767672 | 2732328
+  sieve           | 63.40%  |  2697842 | 4754699 | 2745301
+  slru            | 62.88%  |  2655807 | 4715817 | 2784183
+  s4lru           | 62.67%  |  2877974 | 4700060 | 2799940
+  two-queue       | 61.99%  |  2362205 | 4649519 | 2850481
+  otter           | 61.86%  |  9457755 | 4639781 | 2860219
+  clock           | 56.11%  |  2956248 | 4208167 | 3291833
+  freelru-sharded | 55.45%  | 21067416 | 4159005 | 3340995
+  freelru-synced  | 55.38%  |  4244482 | 4153156 | 3346844
+  lru-groupcache  | 55.37%  |  2463863 | 4153022 | 3346978
+  lru-hashicorp   | 55.36%  |  2776749 | 4152099 | 3347901
+  ```
+  
+The QPS in this benchmark represents mixed Get/Set - otter in particular shines at concurrency
 
 ## License
 

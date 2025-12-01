@@ -179,8 +179,8 @@ func BenchmarkHitRate_ristretto(b *testing.B) {
 	b.ReportMetric(hitRate, "hit%")
 }
 
-// BenchmarkSpeed_bdcache measures raw Get operation speed for bdcache
-func BenchmarkSpeed_bdcache(b *testing.B) {
+// BenchmarkGetSpeed_bdcache measures raw Get operation speed for bdcache
+func BenchmarkGetSpeed_bdcache(b *testing.B) {
 	ctx := context.Background()
 	cache, err := bdcache.New[int, int](ctx, bdcache.WithMemorySize(benchSize))
 	if err != nil {
@@ -203,8 +203,8 @@ func BenchmarkSpeed_bdcache(b *testing.B) {
 	}
 }
 
-// BenchmarkSpeed_LRU measures raw Get operation speed for golang-lru
-func BenchmarkSpeed_LRU(b *testing.B) {
+// BenchmarkGetSpeed_LRU measures raw Get operation speed for golang-lru
+func BenchmarkGetSpeed_LRU(b *testing.B) {
 	cache, err := lru.New[int, int](benchSize)
 	if err != nil {
 		b.Fatal(err)
@@ -222,8 +222,8 @@ func BenchmarkSpeed_LRU(b *testing.B) {
 	}
 }
 
-// BenchmarkSpeed_ristretto measures raw Get operation speed for Ristretto
-func BenchmarkSpeed_ristretto(b *testing.B) {
+// BenchmarkGetSpeed_ristretto measures raw Get operation speed for Ristretto
+func BenchmarkGetSpeed_ristretto(b *testing.B) {
 	cache, err := ristretto.NewCache(&ristretto.Config{
 		NumCounters: benchSize * 10,
 		MaxCost:     benchSize,
@@ -247,8 +247,8 @@ func BenchmarkSpeed_ristretto(b *testing.B) {
 	}
 }
 
-// BenchmarkSpeed_otter measures raw Get operation speed for Otter
-func BenchmarkSpeed_otter(b *testing.B) {
+// BenchmarkGetSpeed_otter measures raw Get operation speed for Otter
+func BenchmarkGetSpeed_otter(b *testing.B) {
 	cache := otter.Must(&otter.Options[int, int]{
 		MaximumSize: benchSize,
 	})
@@ -262,5 +262,68 @@ func BenchmarkSpeed_otter(b *testing.B) {
 	//nolint:intrange // b.N is dynamic and cannot use range
 	for i := 0; i < b.N; i++ {
 		_, _ = cache.GetIfPresent(i % 1000)
+	}
+}
+
+// BenchmarkSetSpeed_bdcache measures raw Set operation speed for bdcache
+func BenchmarkSetSpeed_bdcache(b *testing.B) {
+	ctx := context.Background()
+	cache, err := bdcache.New[int, int](ctx, bdcache.WithMemorySize(benchSize))
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	//nolint:intrange // b.N is dynamic and cannot use range
+	for i := 0; i < b.N; i++ {
+		if err := cache.Set(ctx, i%1000, i, 0); err != nil {
+			b.Fatalf("Set failed: %v", err)
+		}
+	}
+}
+
+// BenchmarkSetSpeed_LRU measures raw Set operation speed for golang-lru
+func BenchmarkSetSpeed_LRU(b *testing.B) {
+	cache, err := lru.New[int, int](benchSize)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	//nolint:intrange // b.N is dynamic and cannot use range
+	for i := 0; i < b.N; i++ {
+		cache.Add(i%1000, i)
+	}
+}
+
+// BenchmarkSetSpeed_ristretto measures raw Set operation speed for Ristretto
+func BenchmarkSetSpeed_ristretto(b *testing.B) {
+	cache, err := ristretto.NewCache(&ristretto.Config{
+		NumCounters: benchSize * 10,
+		MaxCost:     benchSize,
+		BufferItems: 64,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer cache.Close()
+
+	b.ResetTimer()
+	//nolint:intrange // b.N is dynamic and cannot use range
+	for i := 0; i < b.N; i++ {
+		cache.Set(i%1000, i, 1)
+	}
+}
+
+// BenchmarkSetSpeed_otter measures raw Set operation speed for Otter
+func BenchmarkSetSpeed_otter(b *testing.B) {
+	cache := otter.Must(&otter.Options[int, int]{
+		MaximumSize: benchSize,
+	})
+
+	b.ResetTimer()
+	//nolint:intrange // b.N is dynamic and cannot use range
+	for i := 0; i < b.N; i++ {
+		cache.Set(i%1000, i)
 	}
 }
