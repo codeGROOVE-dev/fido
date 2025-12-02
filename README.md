@@ -57,6 +57,7 @@ cache, _ := bdcache.New[string, User](ctx,
   - [`persist/cloudrun`](persist/cloudrun) - Auto-detect Cloud Run
 - **Graceful degradation** - Cache works even if persistence fails
 - **Per-item TTL** - Optional expiration
+- **Faster than a bat out of hell** - Low latency, high throughput
 
 ## Performance against the Competition
 
