@@ -7,7 +7,6 @@ import (
 	"math"
 	"math/rand/v2"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -29,13 +28,25 @@ func TestBenchmarkSuite(t *testing.T) {
 	}
 
 	fmt.Println()
-	fmt.Println("╔══════════════════════════════════════════════════════════════════════════════╗")
-	fmt.Println("║                        BDCACHE BENCHMARK COMPARISON                          ║")
-	fmt.Println("╚══════════════════════════════════════════════════════════════════════════════╝")
+	fmt.Println("bdcache benchmark bake-off")
+	fmt.Println()
 
 	runHitRateBenchmark()
 	runPerformanceBenchmark()
 	runConcurrentBenchmark()
+}
+
+// formatPercent formats a percentage with appropriate precision.
+func formatPercent(pct float64) string {
+	if pct < 10 {
+		return fmt.Sprintf("%.1f%%", pct)
+	}
+	return fmt.Sprintf("%.0f%%", pct)
+}
+
+// formatCacheName returns a cache name padded for alignment.
+func formatCacheName(name string) string {
+	return fmt.Sprintf("%-13s", name)
 }
 
 // =============================================================================
@@ -61,8 +72,6 @@ func runHitRateBenchmark() {
 	fmt.Println("|---------------|---------|-----------|---------|")
 
 	workload := generateWorkload(hitRateWorkload, hitRateKeySpace, hitRateAlpha, 42)
-	// Use sizes that represent 1%, 2.5%, 5% of 1M keyspace
-	// Note: freecache has 512KB minimum, so smaller sizes may give it unfair advantage
 	cacheSizes := []int{10000, 25000, 50000}
 
 	caches := []struct {
@@ -89,29 +98,26 @@ func runHitRateBenchmark() {
 			formatCacheName(c.name), rates[0], rates[1], rates[2])
 	}
 
-	// Print relative performance summary
 	fmt.Println()
 	printHitRateSummary(results)
 }
 
 func printHitRateSummary(results []hitRateResult) {
-	// Calculate average hit rate for each cache across all sizes
+	// Calculate average hit rate for each cache
 	type avgResult struct {
 		name string
 		avg  float64
 	}
 	avgs := make([]avgResult, len(results))
-
 	for i, r := range results {
-		avg := 0.0
+		sum := 0.0
 		for _, rate := range r.rates {
-			avg += rate
+			sum += rate
 		}
-		avg /= float64(len(r.rates))
-		avgs[i] = avgResult{name: r.name, avg: avg}
+		avgs[i] = avgResult{name: r.name, avg: sum / float64(len(r.rates))}
 	}
 
-	// Sort by average hit rate (highest first)
+	// Sort by average (highest first)
 	for i := range len(avgs) - 1 {
 		for j := i + 1; j < len(avgs); j++ {
 			if avgs[j].avg > avgs[i].avg {
@@ -120,27 +126,25 @@ func printHitRateSummary(results []hitRateResult) {
 		}
 	}
 
-	// Find bdcache position
-	var bdcacheIdx int
+	// Find bdcache
+	bdcacheIdx := -1
 	for i, r := range avgs {
 		if r.name == "bdcache" {
 			bdcacheIdx = i
 			break
 		}
 	}
+	if bdcacheIdx < 0 {
+		return
+	}
 
-	bdcacheAvg := avgs[bdcacheIdx].avg
-
+	// Print comparison
 	if bdcacheIdx == 0 {
-		// bdcache is best
-		secondBest := avgs[1]
-		pctBetter := (bdcacheAvg - secondBest.avg) / secondBest.avg * 100
-		fmt.Printf("🏆 Hit rate: +%s better than 2nd best (%s)\n", formatPercent(pctBetter), secondBest.name)
+		pct := (avgs[0].avg - avgs[1].avg) / avgs[1].avg * 100
+		fmt.Printf("- 🏆 Hit rate: %s faster than next best (%s)\n", formatPercent(pct), avgs[1].name)
 	} else {
-		// bdcache is not best
-		best := avgs[0]
-		pctWorse := (best.avg - bdcacheAvg) / bdcacheAvg * 100
-		fmt.Printf("📉 Hit rate: -%s worse than best (%s)\n", formatPercent(pctWorse), best.name)
+		pct := (avgs[0].avg - avgs[bdcacheIdx].avg) / avgs[bdcacheIdx].avg * 100
+		fmt.Printf("- 😱 Hit rate: %s slower than best (%s)\n", formatPercent(pct), avgs[0].name)
 	}
 }
 
@@ -227,10 +231,9 @@ func hitRateTinyLFU(workload []int, cacheSize int) float64 {
 }
 
 func hitRateFreecache(workload []int, cacheSize int) float64 {
-	// freecache uses bytes; estimate ~24 bytes per entry (key + value + overhead)
 	cacheBytes := cacheSize * 24
 	if cacheBytes < 512*1024 {
-		cacheBytes = 512 * 1024 // freecache minimum
+		cacheBytes = 512 * 1024
 	}
 	cache := freecache.NewCache(cacheBytes)
 	var hits int
@@ -248,7 +251,7 @@ func hitRateFreecache(workload []int, cacheSize int) float64 {
 }
 
 // =============================================================================
-// Performance Comparison (using Go benchmark infrastructure)
+// Performance Comparison
 // =============================================================================
 
 const perfCacheSize = 10000
@@ -295,91 +298,48 @@ func runPerformanceBenchmark() {
 			r.setNs, r.setB, r.setAlloc)
 	}
 
-	// Print relative performance summary
 	fmt.Println()
 	printLatencySummary(results, "Get", func(r perfResult) float64 { return r.getNs })
 	printLatencySummary(results, "Set", func(r perfResult) float64 { return r.setNs })
 }
 
-func printLatencySummary(results []perfResult, metric string, getNs func(perfResult) float64) {
-	// Find bdcache and sort by this metric
+func printLatencySummary(results []perfResult, metric string, extract func(perfResult) float64) {
+	// Sort by metric (lowest first for latency)
 	sorted := make([]perfResult, len(results))
 	copy(sorted, results)
 	for i := range len(sorted) - 1 {
 		for j := i + 1; j < len(sorted); j++ {
-			if getNs(sorted[j]) < getNs(sorted[i]) {
+			if extract(sorted[j]) < extract(sorted[i]) {
 				sorted[i], sorted[j] = sorted[j], sorted[i]
 			}
 		}
 	}
 
-	// Find bdcache position and calculate relative performance
-	var bdcacheIdx int
+	// Find bdcache
+	bdcacheIdx := -1
 	for i, r := range sorted {
 		if r.name == "bdcache" {
 			bdcacheIdx = i
 			break
 		}
 	}
+	if bdcacheIdx < 0 {
+		return
+	}
 
-	bdcacheNs := getNs(sorted[bdcacheIdx])
-
+	// Print comparison (for latency, lower is better)
 	if bdcacheIdx == 0 {
-		// bdcache is fastest
-		secondBest := sorted[1]
-		pctFaster := (getNs(secondBest) - bdcacheNs) / bdcacheNs * 100
-		fmt.Printf("🏆 %s latency: +%s faster than 2nd best (%s)\n", metric, formatPercent(pctFaster), secondBest.name)
+		pct := (extract(sorted[1]) - extract(sorted[0])) / extract(sorted[0]) * 100
+		fmt.Printf("- 🏆 %s: %s faster than next best (%s)\n", metric, formatPercent(pct), sorted[1].name)
 	} else {
-		// bdcache is not fastest
-		best := sorted[0]
-		pctSlower := (bdcacheNs - getNs(best)) / getNs(best) * 100
-		fmt.Printf("📉 %s latency: -%s slower than best (%s)\n", metric, formatPercent(pctSlower), best.name)
+		pct := (extract(sorted[bdcacheIdx]) - extract(sorted[0])) / extract(sorted[0]) * 100
+		fmt.Printf("- 😱 %s: %s slower than best (%s)\n", metric, formatPercent(pct), sorted[0].name)
 	}
-}
-
-// formatPercent formats a percentage with appropriate precision.
-// Uses 1 decimal place for values < 10%, otherwise no decimals.
-func formatPercent(pct float64) string {
-	if pct < 10 {
-		return fmt.Sprintf("%.1f%%", pct)
-	}
-	return fmt.Sprintf("%.0f%%", pct)
-}
-
-// cacheEmoji returns the emoji for a cache library.
-// Each emoji is chosen to represent something about the library.
-var cacheEmoji = map[string]string{
-	"bdcache":   "🟡", // yellow circle - our cache
-	"otter":     "🦦", // otter - the animal
-	"ristretto": "☕", // coffee - Italian espresso
-	"tinylfu":   "🔬", // microscope - tiny/research
-	"freecache": "🆓", // free sign
-	"lru":       "📚", // books - classic algorithm
-}
-
-// formatCacheName returns a cache name with its emoji, padded for alignment.
-// All entries use the same format: "name emoji" with padding to 13 visual chars.
-// Since emojis take 2 visual chars but more bytes, we manually construct the string.
-func formatCacheName(name string) string {
-	emoji := cacheEmoji[name]
-	if emoji == "" {
-		return fmt.Sprintf("%-13s", name)
-	}
-	// Construct: "name emoji" then pad with spaces to reach 13 visual chars
-	// emoji = 2 visual chars, so we need (13 - len(name) - 1 - 2) spaces after emoji
-	// where 1 is the space between name and emoji
-	visualLen := len(name) + 1 + 2 // name + space + emoji(2 visual)
-	padding := 13 - visualLen
-	if padding < 0 {
-		padding = 0
-	}
-	return name + " " + emoji + strings.Repeat(" ", padding)
 }
 
 func measurePerf(name string, getFn, setFn func(b *testing.B)) perfResult {
 	getResult := testing.Benchmark(getFn)
 	setResult := testing.Benchmark(setFn)
-
 	return perfResult{
 		name:     name,
 		getNs:    float64(getResult.NsPerOp()),
@@ -585,46 +545,43 @@ func runConcurrentBenchmark() {
 				formatCacheName(r.name), r.getQPS/1e6, r.setQPS/1e6)
 		}
 
-		// Print relative performance summary
 		fmt.Println()
 		printThroughputSummary(results, "Get", func(r concurrentResult) float64 { return r.getQPS })
 		printThroughputSummary(results, "Set", func(r concurrentResult) float64 { return r.setQPS })
 	}
 }
 
-func printThroughputSummary(results []concurrentResult, metric string, getQPS func(concurrentResult) float64) {
-	// Sort by this metric (highest first for throughput)
+func printThroughputSummary(results []concurrentResult, metric string, extract func(concurrentResult) float64) {
+	// Sort by metric (highest first for throughput)
 	sorted := make([]concurrentResult, len(results))
 	copy(sorted, results)
 	for i := range len(sorted) - 1 {
 		for j := i + 1; j < len(sorted); j++ {
-			if getQPS(sorted[j]) > getQPS(sorted[i]) {
+			if extract(sorted[j]) > extract(sorted[i]) {
 				sorted[i], sorted[j] = sorted[j], sorted[i]
 			}
 		}
 	}
 
-	// Find bdcache position
-	var bdcacheIdx int
+	// Find bdcache
+	bdcacheIdx := -1
 	for i, r := range sorted {
 		if r.name == "bdcache" {
 			bdcacheIdx = i
 			break
 		}
 	}
+	if bdcacheIdx < 0 {
+		return
+	}
 
-	bdcacheQPS := getQPS(sorted[bdcacheIdx])
-
+	// Print comparison (for throughput, higher is better)
 	if bdcacheIdx == 0 {
-		// bdcache is fastest
-		secondBest := sorted[1]
-		pctFaster := (bdcacheQPS - getQPS(secondBest)) / getQPS(secondBest) * 100
-		fmt.Printf("🏆 %s throughput: +%s faster than 2nd best (%s)\n", metric, formatPercent(pctFaster), secondBest.name)
+		pct := (extract(sorted[0]) - extract(sorted[1])) / extract(sorted[1]) * 100
+		fmt.Printf("- 🏆 %s: %s faster than next best (%s)\n", metric, formatPercent(pct), sorted[1].name)
 	} else {
-		// bdcache is not fastest
-		best := sorted[0]
-		pctSlower := (getQPS(best) - bdcacheQPS) / bdcacheQPS * 100
-		fmt.Printf("📉 %s throughput: -%s slower than best (%s)\n", metric, formatPercent(pctSlower), best.name)
+		pct := (extract(sorted[0]) - extract(sorted[bdcacheIdx])) / extract(sorted[bdcacheIdx]) * 100
+		fmt.Printf("- 😱 %s: %s slower than best (%s)\n", metric, formatPercent(pct), sorted[0].name)
 	}
 }
 
