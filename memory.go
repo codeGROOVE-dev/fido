@@ -65,12 +65,7 @@ func (c *MemoryCache[K, V]) SetIfAbsent(key K, value V, ttl ...time.Duration) (V
 	if len(ttl) > 0 {
 		t = ttl[0]
 	}
-	expiry := c.expiry(t)
-	var expiryNano int64
-	if !expiry.IsZero() {
-		expiryNano = expiry.UnixNano()
-	}
-	return c.memory.getOrSetMemory(key, value, expiryNano)
+	return c.memory.getOrSetMemory(key, value, timeToNano(c.expiry(t)))
 }
 
 // Set stores a value in the cache.
@@ -81,7 +76,7 @@ func (c *MemoryCache[K, V]) Set(key K, value V, ttl ...time.Duration) {
 	if len(ttl) > 0 {
 		t = ttl[0]
 	}
-	c.memory.setToMemory(key, value, c.expiryNano(t))
+	c.memory.setToMemory(key, value, timeToNano(c.expiry(t)))
 }
 
 // Delete removes a value from the cache.
@@ -104,17 +99,6 @@ func (c *MemoryCache[K, V]) Flush() int {
 // For MemoryCache this is a no-op, but provided for API consistency.
 func (*MemoryCache[K, V]) Close() {
 	// No-op for memory-only cache
-}
-
-// expiryNano returns the expiry time in nanoseconds (0 means no expiry).
-func (c *MemoryCache[K, V]) expiryNano(ttl time.Duration) int64 {
-	if ttl <= 0 {
-		ttl = c.defaultTTL
-	}
-	if ttl <= 0 {
-		return 0
-	}
-	return time.Now().Add(ttl).UnixNano()
 }
 
 // expiry returns the expiry time based on TTL and default TTL.

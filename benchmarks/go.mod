@@ -20,3 +20,5 @@ require (
 )
 
 replace github.com/codeGROOVE-dev/sfcache => ../
+
+replace github.com/codeGROOVE-dev/sfcache/pkg/persist => ../pkg/persist

@@ -6,6 +6,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/codeGROOVE-dev/sfcache/pkg/persist"
 )
 
 // mockStore is a simple in-memory store for testing.
@@ -27,6 +29,18 @@ func newMockStore[K comparable, V any]() *mockStore[K, V] {
 	return &mockStore[K, V]{
 		data: make(map[string]mockEntry[V]),
 	}
+}
+
+func (m *mockStore[K, V]) setFailGet(v bool) {
+	m.mu.Lock()
+	m.failGet = v
+	m.mu.Unlock()
+}
+
+func (m *mockStore[K, V]) setFailSet(v bool) {
+	m.mu.Lock()
+	m.failSet = v
+	m.mu.Unlock()
 }
 
 func (m *mockStore[K, V]) ValidateKey(key K) error {
@@ -87,8 +101,8 @@ func (m *mockStore[K, V]) Delete(ctx context.Context, key K) error {
 }
 
 //nolint:gocritic // Channel returns are clearer without named results
-func (m *mockStore[K, V]) LoadRecent(ctx context.Context, limit int) (<-chan Entry[K, V], <-chan error) {
-	entryCh := make(chan Entry[K, V], 10)
+func (m *mockStore[K, V]) LoadRecent(ctx context.Context, limit int) (<-chan persist.Entry[K, V], <-chan error) {
+	entryCh := make(chan persist.Entry[K, V], 10)
 	errCh := make(chan error, 1)
 
 	go func() {
@@ -115,7 +129,7 @@ func (m *mockStore[K, V]) LoadRecent(ctx context.Context, limit int) (<-chan Ent
 				key = sk
 			}
 
-			entryCh <- Entry[K, V]{
+			entryCh <- persist.Entry[K, V]{
 				Key:       key,
 				Value:     entry.value,
 				Expiry:    entry.expiry,
@@ -360,7 +374,7 @@ func TestPersistentCache_Errors(t *testing.T) {
 
 	// Set returns error when persistence fails (by design)
 	// Value is still in memory, but error is returned to caller
-	store.failSet = true
+	store.setFailSet(true)
 	if err := cache.Set(ctx, "key1", 42, 0); err == nil {
 		t.Error("Set should return error when persistence fails")
 	}
@@ -375,7 +389,7 @@ func TestPersistentCache_Errors(t *testing.T) {
 	}
 
 	// SetAsync logs persistence errors but doesn't return them
-	store.failSet = true
+	store.setFailSet(true)
 	if err := cache.SetAsync(ctx, "key3", 300, 0); err != nil {
 		t.Fatalf("SetAsync should not fail synchronously: %v", err)
 	}
@@ -393,8 +407,8 @@ func TestPersistentCache_Errors(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	// Get should work from memory even if persistence fails
-	store.failGet = true
-	store.failSet = false
+	store.setFailGet(true)
+	store.setFailSet(false)
 	if err := cache.Set(ctx, "key2", 100, 0); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
@@ -418,7 +432,7 @@ func TestPersistentCache_Delete_Errors(t *testing.T) {
 	defer func() { _ = cache.Close() }() //nolint:errcheck // Test cleanup
 
 	// Store a value (with failSet = false)
-	store.failSet = false
+	store.setFailSet(false)
 	if err := cache.Set(ctx, "key1", 42, 0); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
@@ -433,7 +447,7 @@ func TestPersistentCache_Delete_Errors(t *testing.T) {
 	}
 
 	// Now make persistence delete fail
-	store.failSet = true // failSet affects Delete too in mock
+	store.setFailSet(true) // failSet affects Delete too in mock
 	err = cache.Delete(ctx, "key1")
 	if err == nil {
 		t.Error("Delete should return error when persistence fails")
@@ -492,7 +506,7 @@ func TestPersistentCache_Get_PersistenceLoadError(t *testing.T) {
 	_ = store.Store(ctx, "key1", 42, time.Time{}) //nolint:errcheck // Test fixture
 
 	// Make persistence Load fail
-	store.failGet = true
+	store.setFailGet(true)
 
 	// Get should return error on persistence failure
 	_, found, err := cache.Get(ctx, "key1")

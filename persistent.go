@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
+
+	"github.com/codeGROOVE-dev/sfcache/pkg/persist"
 )
 
 // PersistentCache is a cache backed by both memory and persistent storage.
@@ -15,7 +17,7 @@ type PersistentCache[K comparable, V any] struct {
 	//   cache.Store.Len(ctx)
 	//   cache.Store.Flush(ctx)
 	//   cache.Store.Cleanup(ctx, maxAge)
-	Store PersistenceLayer[K, V]
+	Store persist.Layer[K, V]
 
 	memory     *s3fifo[K, V]
 	defaultTTL time.Duration
@@ -41,7 +43,7 @@ type PersistentCache[K comparable, V any] struct {
 //	cache.Set(ctx, "user:123", user, time.Hour)   // explicit TTL
 //	user, ok, err := cache.Get(ctx, "user:123")
 //	storeCount, _ := cache.Store.Len(ctx)
-func Persistent[K comparable, V any](ctx context.Context, p PersistenceLayer[K, V], opts ...Option) (*PersistentCache[K, V], error) {
+func Persistent[K comparable, V any](ctx context.Context, p persist.Layer[K, V], opts ...Option) (*PersistentCache[K, V], error) {
 	cfg := defaultConfig()
 	for _, opt := range opts {
 		opt(cfg)
