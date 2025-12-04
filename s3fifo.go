@@ -98,6 +98,10 @@ type shard[K comparable, V any] struct {
 	capacity  int
 	smallCap  int
 	ghostCap  int
+
+	// Free lists for reducing allocations
+	freeEntries      *entry[K, V]
+	freeGhostEntries *ghostEntry[K]
 }
 
 // entryList is an intrusive doubly-linked list for cache entries.
@@ -289,6 +293,51 @@ func newShard[K comparable, V any](capacity int) *shard[K, V] {
 	return s
 }
 
+func (s *shard[K, V]) getEntry() *entry[K, V] {
+	if s.freeEntries != nil {
+		e := s.freeEntries
+		s.freeEntries = e.next
+		e.next = nil
+		e.prev = nil
+		return e
+	}
+	return &entry[K, V]{}
+}
+
+func (s *shard[K, V]) putEntry(e *entry[K, V]) {
+	var zeroK K
+	var zeroV V
+	e.key = zeroK
+	e.value = zeroV
+	e.expiryNano = 0
+	e.accessed.Store(false)
+	e.inSmall = false
+	e.prev = nil
+
+	e.next = s.freeEntries
+	s.freeEntries = e
+}
+
+func (s *shard[K, V]) getGhostEntry() *ghostEntry[K] {
+	if s.freeGhostEntries != nil {
+		e := s.freeGhostEntries
+		s.freeGhostEntries = e.next
+		e.next = nil
+		e.prev = nil
+		return e
+	}
+	return &ghostEntry[K]{}
+}
+
+func (s *shard[K, V]) putGhostEntry(e *ghostEntry[K]) {
+	var zeroK K
+	e.key = zeroK
+	e.prev = nil
+
+	e.next = s.freeGhostEntries
+	s.freeGhostEntries = e
+}
+
 // getShard returns the shard for a given key using type-optimized hashing.
 // Uses bitwise AND with shardMask for fast modulo (numShards must be power of 2).
 // Fast paths for int, int64, and string keys avoid the type switch overhead entirely.
@@ -418,14 +467,14 @@ func (s *shard[K, V]) getOrSet(key K, value V, expiryNano int64) (V, bool) {
 		inGhost = true
 		s.ghost.remove(ghostEnt)
 		delete(s.ghostKeys, key)
+		s.putGhostEntry(ghostEnt)
 	}
 
-	ent := &entry[K, V]{
-		key:        key,
-		value:      value,
-		expiryNano: expiryNano,
-		inSmall:    !inGhost,
-	}
+	ent := s.getEntry()
+	ent.key = key
+	ent.value = value
+	ent.expiryNano = expiryNano
+	ent.inSmall = !inGhost
 
 	for s.small.len+s.main.len >= s.capacity {
 		s.evict()
@@ -467,15 +516,15 @@ func (s *shard[K, V]) set(key K, value V, expiryNano int64) {
 		inGhost = true
 		s.ghost.remove(ghostEnt)
 		delete(s.ghostKeys, key)
+		s.putGhostEntry(ghostEnt)
 	}
 
 	// Create new entry
-	ent := &entry[K, V]{
-		key:        key,
-		value:      value,
-		expiryNano: expiryNano,
-		inSmall:    !inGhost,
-	}
+	ent := s.getEntry()
+	ent.key = key
+	ent.value = value
+	ent.expiryNano = expiryNano
+	ent.inSmall = !inGhost
 
 	// Make room if at capacity
 	for s.small.len+s.main.len >= s.capacity {
@@ -515,6 +564,7 @@ func (s *shard[K, V]) delete(key K) {
 	}
 
 	delete(s.items, key)
+	s.putEntry(ent)
 }
 
 // evict removes one item according to S3-FIFO algorithm.
@@ -537,6 +587,7 @@ func (s *shard[K, V]) evictFromSmall() {
 			// Not accessed - evict and track in ghost
 			delete(s.items, ent.key)
 			s.addToGhost(ent.key)
+			s.putEntry(ent)
 			return
 		}
 
@@ -556,6 +607,7 @@ func (s *shard[K, V]) evictFromMain() {
 		if !ent.accessed.Swap(false) {
 			// Not accessed - evict
 			delete(s.items, ent.key)
+			s.putEntry(ent)
 			return
 		}
 
@@ -570,9 +622,11 @@ func (s *shard[K, V]) addToGhost(key K) {
 		oldest := s.ghost.front()
 		delete(s.ghostKeys, oldest.key)
 		s.ghost.remove(oldest)
+		s.putGhostEntry(oldest)
 	}
 
-	ent := &ghostEntry[K]{key: key}
+	ent := s.getGhostEntry()
+	ent.key = key
 	s.ghost.pushBack(ent)
 	s.ghostKeys[key] = ent
 }
