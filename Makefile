@@ -19,7 +19,7 @@ bench:
 # 4. Zipf Throughput (1 thread)
 # 5. Zipf Throughput (16 threads)
 benchmark:
-	@echo "=== bdcache Benchmark Suite ==="
+	@echo "=== sfcache Benchmark Suite ==="
 	@cd benchmarks && go test -run=TestBenchmarkSuite -v -timeout=300s
 
 clean:

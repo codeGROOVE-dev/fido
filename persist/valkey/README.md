@@ -14,15 +14,15 @@ Valkey/Redis persistence for shared cache across instances.
 
 ```go
 import (
-    "github.com/codeGROOVE-dev/bdcache"
-    "github.com/codeGROOVE-dev/bdcache/persist/valkey"
+    "github.com/codeGROOVE-dev/sfcache"
+    "github.com/codeGROOVE-dev/sfcache/persist/valkey"
 )
 
 // Connect to Valkey/Redis server
 p, _ := valkey.New[string, User](ctx, "myapp", "localhost:6379")
 
-cache, _ := bdcache.New[string, User](ctx,
-    bdcache.WithPersistence(p))
+cache, _ := sfcache.New[string, User](ctx,
+    sfcache.WithPersistence(p))
 ```
 
 ## Configuration

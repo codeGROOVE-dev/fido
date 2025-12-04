@@ -1,4 +1,4 @@
-// Package datastore provides Google Cloud Datastore persistence for bdcache.
+// Package datastore provides Google Cloud Datastore persistence for sfcache.
 package datastore
 
 import (
@@ -9,8 +9,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/codeGROOVE-dev/bdcache"
 	ds "github.com/codeGROOVE-dev/ds9/pkg/datastore"
+	"github.com/codeGROOVE-dev/sfcache"
 )
 
 const (
@@ -56,7 +56,7 @@ type datastoreEntry struct {
 // New creates a new Datastore-based persistence layer.
 // The cacheID is used as the Datastore database name.
 // An empty projectID will be auto-detected from the environment.
-func New[K comparable, V any](ctx context.Context, cacheID string) (bdcache.PersistenceLayer[K, V], error) {
+func New[K comparable, V any](ctx context.Context, cacheID string) (sfcache.PersistenceLayer[K, V], error) {
 	// Empty project ID lets ds9 auto-detect
 	client, err := ds.NewClientWithDatabase(ctx, "", cacheID)
 	if err != nil {
@@ -149,8 +149,8 @@ func (p *persister[K, V]) Delete(ctx context.Context, key K) error {
 }
 
 // LoadRecent streams entries from Datastore, returning up to 'limit' most recently updated entries.
-func (p *persister[K, V]) LoadRecent(ctx context.Context, limit int) (entries <-chan bdcache.Entry[K, V], errs <-chan error) {
-	entryCh := make(chan bdcache.Entry[K, V], 100)
+func (p *persister[K, V]) LoadRecent(ctx context.Context, limit int) (entries <-chan sfcache.Entry[K, V], errs <-chan error) {
+	entryCh := make(chan sfcache.Entry[K, V], 100)
 	errCh := make(chan error, 1)
 
 	go func() {
@@ -215,7 +215,7 @@ func (p *persister[K, V]) LoadRecent(ctx context.Context, limit int) (entries <-
 				continue
 			}
 
-			entryCh <- bdcache.Entry[K, V]{
+			entryCh <- sfcache.Entry[K, V]{
 				Key:       key,
 				Value:     value,
 				Expiry:    entry.Expiry,

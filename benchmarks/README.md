@@ -1,4 +1,4 @@
-# bdcache Benchmarks
+# sfcache Benchmarks
 
 This directory contains comparison benchmarks against popular Go cache libraries.
 
@@ -32,7 +32,7 @@ Your mileage **will** vary based on:
 
 ### The Real Differentiator: Persistence
 
-**bdcache's primary advantage isn't raw speed or hit rates** - it's the automatic per-item persistence designed for unreliable cloud environments:
+**sfcache's primary advantage isn't raw speed or hit rates** - it's the automatic per-item persistence designed for unreliable cloud environments:
 
 - **Cloud Run** - Instances shut down unpredictably after idle periods
 - **Kubernetes** - Pods can be evicted, rescheduled, or killed anytime
@@ -87,7 +87,7 @@ go test -bench=BenchmarkSpeed -benchmem
 ```
 
 Compares raw Get operation performance across:
-- bdcache (S3-FIFO)
+- sfcache (S3-FIFO)
 - golang-lru (LRU)
 - otter (S3-FIFO with manual persistence)
 - ristretto (TinyLFU)

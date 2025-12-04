@@ -12,7 +12,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/codeGROOVE-dev/bdcache"
+	"github.com/codeGROOVE-dev/sfcache"
 	"github.com/coocood/freecache"
 	"github.com/dgraph-io/ristretto"
 	lru "github.com/hashicorp/golang-lru/v2"
@@ -103,7 +103,7 @@ func runMetaTraceHitRate() {
 		name string
 		fn   func([]traceOp, int) float64
 	}{
-		{"bdcache", runMetaTraceBdcache},
+		{"sfcache", runMetaTraceSFCache},
 		{"otter", runMetaTraceOtter},
 		{"ristretto", runMetaTraceRistretto},
 		{"tinylfu", runMetaTraceTinyLFU},
@@ -126,16 +126,16 @@ func runMetaTraceHitRate() {
 }
 
 func printMetaTraceSummary(results []metaTraceResult) {
-	// Find bdcache and best performer at 100K
-	var bdcacheRate, bestRate float64
+	// Find sfcache and best performer at 100K
+	var sfcacheRate, bestRate float64
 	var bestName string
-	bdcacheIdx := -1
+	sfcacheIdx := -1
 
 	for i, r := range results {
 		rate := r.rates[1] // 100K cache size
-		if r.name == "bdcache" {
-			bdcacheRate = rate
-			bdcacheIdx = i
+		if r.name == "sfcache" {
+			sfcacheRate = rate
+			sfcacheIdx = i
 		}
 		if rate > bestRate {
 			bestRate = rate
@@ -143,25 +143,25 @@ func printMetaTraceSummary(results []metaTraceResult) {
 		}
 	}
 
-	if bdcacheIdx < 0 {
+	if sfcacheIdx < 0 {
 		return
 	}
 
-	if bdcacheRate >= bestRate {
+	if sfcacheRate >= bestRate {
 		// Find second best
 		var secondBest float64
 		var secondName string
 		for _, r := range results {
 			rate := r.rates[1]
-			if r.name != "bdcache" && rate > secondBest {
+			if r.name != "sfcache" && rate > secondBest {
 				secondBest = rate
 				secondName = r.name
 			}
 		}
-		pct := (bdcacheRate - secondBest) / secondBest * 100
+		pct := (sfcacheRate - secondBest) / secondBest * 100
 		fmt.Printf("- 🔥 Meta trace: %s better than next best (%s)\n\n", formatPercent(pct), secondName)
 	} else {
-		pct := (bestRate - bdcacheRate) / bdcacheRate * 100
+		pct := (bestRate - sfcacheRate) / sfcacheRate * 100
 		fmt.Printf("- 💧 Meta trace: %s worse than best (%s)\n\n", formatPercent(pct), bestName)
 	}
 }
@@ -196,7 +196,7 @@ func TestMetaTrace(t *testing.T) {
 			name    string
 			hitRate float64
 		}{
-			{"bdcache", runMetaTraceBdcache(ops, cacheSize)},
+			{"sfcache", runMetaTraceSFCache(ops, cacheSize)},
 			{"otter", runMetaTraceOtter(ops, cacheSize)},
 			{"ristretto", runMetaTraceRistretto(ops, cacheSize)},
 			{"tinylfu", runMetaTraceTinyLFU(ops, cacheSize)},
@@ -246,7 +246,7 @@ func TestMetaTraceTuning(t *testing.T) {
 
 	for _, small := range smallRatios {
 		for _, ghost := range ghostRatios {
-			rate := runMetaTraceBdcacheWithParams(ops, cacheSize, small, ghost)
+			rate := runMetaTraceSFCacheWithParams(ops, cacheSize, small, ghost)
 			delta := (rate - lruRate) * 100
 			sign := "+"
 			if delta < 0 {
@@ -265,11 +265,11 @@ func TestMetaTraceTuning(t *testing.T) {
 		best.small*100, best.ghost*100, best.rate*100, lruRate*100)
 }
 
-func runMetaTraceBdcacheWithParams(ops []traceOp, cacheSize int, smallRatio, ghostRatio float64) float64 {
-	cache := bdcache.Memory[string, string](
-		bdcache.WithSize(cacheSize),
-		bdcache.WithSmallRatio(smallRatio),
-		bdcache.WithGhostRatio(ghostRatio),
+func runMetaTraceSFCacheWithParams(ops []traceOp, cacheSize int, smallRatio, ghostRatio float64) float64 {
+	cache := sfcache.Memory[string, string](
+		sfcache.WithSize(cacheSize),
+		sfcache.WithSmallRatio(smallRatio),
+		sfcache.WithGhostRatio(ghostRatio),
 	)
 	defer cache.Close()
 
@@ -290,8 +290,8 @@ func runMetaTraceBdcacheWithParams(ops []traceOp, cacheSize int, smallRatio, gho
 	return float64(hits) / float64(hits+misses)
 }
 
-func runMetaTraceBdcache(ops []traceOp, cacheSize int) float64 {
-	cache := bdcache.Memory[string, string](bdcache.WithSize(cacheSize))
+func runMetaTraceSFCache(ops []traceOp, cacheSize int) float64 {
+	cache := sfcache.Memory[string, string](sfcache.WithSize(cacheSize))
 	defer cache.Close()
 
 	var hits, misses int64

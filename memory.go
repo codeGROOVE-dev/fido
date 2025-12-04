@@ -1,5 +1,5 @@
-// Package bdcache provides a high-performance cache with S3-FIFO eviction and optional persistence.
-package bdcache
+// Package sfcache provides a high-performance cache with S3-FIFO eviction and optional persistence.
+package sfcache
 
 import (
 	"time"
@@ -16,9 +16,9 @@ type MemoryCache[K comparable, V any] struct {
 //
 // Example:
 //
-//	cache := bdcache.Memory[string, User](
-//	    bdcache.WithSize(10000),
-//	    bdcache.WithTTL(time.Hour),
+//	cache := sfcache.Memory[string, User](
+//	    sfcache.WithSize(10000),
+//	    sfcache.WithTTL(time.Hour),
 //	)
 //	defer cache.Close()
 //

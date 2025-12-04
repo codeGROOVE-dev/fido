@@ -1,5 +1,5 @@
 //go:build race
 
-package bdcache
+package sfcache
 
 const raceEnabled = true

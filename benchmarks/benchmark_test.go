@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/codeGROOVE-dev/bdcache"
+	"github.com/codeGROOVE-dev/sfcache"
 	"github.com/coocood/freecache"
 	"github.com/dgraph-io/ristretto"
 	lru "github.com/hashicorp/golang-lru/v2"
@@ -24,7 +24,7 @@ import (
 // Full Benchmark Suite
 // =============================================================================
 
-// TestBenchmarkSuite runs the 5 key benchmarks for tracking bdcache performance.
+// TestBenchmarkSuite runs the 5 key benchmarks for tracking sfcache performance.
 // Run with: go test -run=TestBenchmarkSuite -v
 func TestBenchmarkSuite(t *testing.T) {
 	if testing.Short() {
@@ -32,7 +32,7 @@ func TestBenchmarkSuite(t *testing.T) {
 	}
 
 	fmt.Println()
-	fmt.Println("bdcache benchmark bake-off")
+	fmt.Println("sfcache benchmark bake-off")
 	fmt.Println()
 
 	// 1. Real-world hit rate from Meta KVCache production trace
@@ -65,8 +65,8 @@ func printTestHeader(testName, description string) {
 // =============================================================================
 
 // Single-threaded benchmarks
-func BenchmarkBdcacheGet(b *testing.B)   { benchBdcacheGet(b) }
-func BenchmarkBdcacheSet(b *testing.B)   { benchBdcacheSet(b) }
+func BenchmarkSFCacheGet(b *testing.B)   { benchSFCacheGet(b) }
+func BenchmarkSFCacheSet(b *testing.B)   { benchSFCacheSet(b) }
 func BenchmarkOtterGet(b *testing.B)     { benchOtterGet(b) }
 func BenchmarkOtterSet(b *testing.B)     { benchOtterSet(b) }
 func BenchmarkRistrettoGet(b *testing.B) { benchRistrettoGet(b) }
@@ -132,7 +132,7 @@ func runHitRateBenchmark() {
 		name string
 		fn   func([]int, int) float64
 	}{
-		{"bdcache", hitRateBdcache},
+		{"sfcache", hitRateSFCache},
 		{"otter", hitRateOtter},
 		{"ristretto", hitRateRistretto},
 		{"tinylfu", hitRateTinyLFU},
@@ -178,22 +178,22 @@ func printHitRateSummary(results []hitRateResult) {
 		}
 	}
 
-	bdcacheIdx := -1
+	sfcacheIdx := -1
 	for i, r := range avgs {
-		if r.name == "bdcache" {
-			bdcacheIdx = i
+		if r.name == "sfcache" {
+			sfcacheIdx = i
 			break
 		}
 	}
-	if bdcacheIdx < 0 {
+	if sfcacheIdx < 0 {
 		return
 	}
 
-	if bdcacheIdx == 0 {
+	if sfcacheIdx == 0 {
 		pct := (avgs[0].avg - avgs[1].avg) / avgs[1].avg * 100
 		fmt.Printf("- 🔥 Hit rate: %s better than next best (%s)\n\n", formatPercent(pct), avgs[1].name)
 	} else {
-		pct := (avgs[0].avg - avgs[bdcacheIdx].avg) / avgs[bdcacheIdx].avg * 100
+		pct := (avgs[0].avg - avgs[sfcacheIdx].avg) / avgs[sfcacheIdx].avg * 100
 		fmt.Printf("- 💧 Hit rate: %s worse than best (%s)\n\n", formatPercent(pct), avgs[0].name)
 	}
 }
@@ -242,8 +242,8 @@ func computeZeta(n uint64, theta float64) float64 {
 	return sum
 }
 
-func hitRateBdcache(workload []int, cacheSize int) float64 {
-	cache := bdcache.Memory[int, int](bdcache.WithSize(cacheSize))
+func hitRateSFCache(workload []int, cacheSize int) float64 {
+	cache := sfcache.Memory[int, int](sfcache.WithSize(cacheSize))
 	var hits int
 	for _, key := range workload {
 		if _, found := cache.Get(key); found {
@@ -362,7 +362,7 @@ type perfResult struct {
 
 func runPerformanceBenchmark() {
 	results := []perfResult{
-		measurePerf("bdcache", benchBdcacheGet, benchBdcacheSet),
+		measurePerf("sfcache", benchSFCacheGet, benchSFCacheSet),
 		measurePerf("otter", benchOtterGet, benchOtterSet),
 		measurePerf("ristretto", benchRistrettoGet, benchRistrettoSet),
 		measurePerf("tinylfu", benchTinyLFUGet, benchTinyLFUSet),
@@ -408,22 +408,22 @@ func printLatencySummary(results []perfResult, metric string, extract func(perfR
 		}
 	}
 
-	bdcacheIdx := -1
+	sfcacheIdx := -1
 	for i, r := range sorted {
-		if r.name == "bdcache" {
-			bdcacheIdx = i
+		if r.name == "sfcache" {
+			sfcacheIdx = i
 			break
 		}
 	}
-	if bdcacheIdx < 0 {
+	if sfcacheIdx < 0 {
 		return
 	}
 
-	if bdcacheIdx == 0 {
+	if sfcacheIdx == 0 {
 		pct := (extract(sorted[1]) - extract(sorted[0])) / extract(sorted[0]) * 100
 		fmt.Printf("- 🔥 %s: %s better than next best (%s)\n", metric, formatPercent(pct), sorted[1].name)
 	} else {
-		pct := (extract(sorted[bdcacheIdx]) - extract(sorted[0])) / extract(sorted[0]) * 100
+		pct := (extract(sorted[sfcacheIdx]) - extract(sorted[0])) / extract(sorted[0]) * 100
 		fmt.Printf("- 💧 %s: %s worse than best (%s)\n", metric, formatPercent(pct), sorted[0].name)
 	}
 }
@@ -442,8 +442,8 @@ func measurePerf(name string, getFn, setFn func(b *testing.B)) perfResult {
 	}
 }
 
-func benchBdcacheGet(b *testing.B) {
-	cache := bdcache.Memory[int, int](bdcache.WithSize(perfCacheSize))
+func benchSFCacheGet(b *testing.B) {
+	cache := sfcache.Memory[int, int](sfcache.WithSize(perfCacheSize))
 	for i := range perfCacheSize {
 		cache.Set(i, i)
 	}
@@ -453,8 +453,8 @@ func benchBdcacheGet(b *testing.B) {
 	}
 }
 
-func benchBdcacheSet(b *testing.B) {
-	cache := bdcache.Memory[int, int](bdcache.WithSize(perfCacheSize))
+func benchSFCacheSet(b *testing.B) {
+	cache := sfcache.Memory[int, int](sfcache.WithSize(perfCacheSize))
 	b.ResetTimer()
 	for i := range b.N {
 		cache.Set(i%perfCacheSize, i)
@@ -601,22 +601,22 @@ type concurrentResult struct {
 
 func printThroughputSummary(results []concurrentResult) {
 	// Results are already sorted by qps descending
-	bdcacheIdx := -1
+	sfcacheIdx := -1
 	for i, r := range results {
-		if r.name == "bdcache" {
-			bdcacheIdx = i
+		if r.name == "sfcache" {
+			sfcacheIdx = i
 			break
 		}
 	}
-	if bdcacheIdx < 0 {
+	if sfcacheIdx < 0 {
 		return
 	}
 
-	if bdcacheIdx == 0 {
+	if sfcacheIdx == 0 {
 		pct := (results[0].qps - results[1].qps) / results[1].qps * 100
 		fmt.Printf("- 🔥 Throughput: %s faster than next best (%s)\n\n", formatPercent(pct), results[1].name)
 	} else {
-		pct := (results[0].qps - results[bdcacheIdx].qps) / results[bdcacheIdx].qps * 100
+		pct := (results[0].qps - results[sfcacheIdx].qps) / results[sfcacheIdx].qps * 100
 		fmt.Printf("- 💧 Throughput: %s slower than best (%s)\n\n", formatPercent(pct), results[0].name)
 	}
 }
@@ -638,7 +638,7 @@ func runZipfThroughputBenchmark(threads int) {
 	// Generate Zipf workload once for all caches
 	workload := generateWorkload(zipfWorkloadSize, perfCacheSize, zipfAlpha, 42)
 
-	caches := []string{"bdcache", "otter", "ristretto", "tinylfu", "freecache", "lru"}
+	caches := []string{"sfcache", "otter", "ristretto", "tinylfu", "freecache", "lru"}
 
 	results := make([]concurrentResult, len(caches))
 	for i, name := range caches {
@@ -680,8 +680,8 @@ func measureZipfQPS(cacheName string, threads int, workload []int) float64 {
 	var ristrettoCache *ristretto.Cache // Track for cleanup
 
 	switch cacheName {
-	case "bdcache":
-		cache := bdcache.Memory[int, int](bdcache.WithSize(perfCacheSize))
+	case "sfcache":
+		cache := sfcache.Memory[int, int](sfcache.WithSize(perfCacheSize))
 		for i := range perfCacheSize {
 			cache.Set(i, i)
 		}

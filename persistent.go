@@ -1,4 +1,4 @@
-package bdcache
+package sfcache
 
 import (
 	"context"
@@ -27,10 +27,10 @@ type PersistentCache[K comparable, V any] struct {
 // Example:
 //
 //	store, _ := localfs.New[string, User]("myapp", "")
-//	cache, err := bdcache.Persistent[string, User](ctx, store,
-//	    bdcache.WithSize(10000),
-//	    bdcache.WithTTL(time.Hour),
-//	    bdcache.WithWarmup(1000),
+//	cache, err := sfcache.Persistent[string, User](ctx, store,
+//	    sfcache.WithSize(10000),
+//	    sfcache.WithTTL(time.Hour),
+//	    sfcache.WithWarmup(1000),
 //	)
 //	if err != nil {
 //	    return err

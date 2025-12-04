@@ -7,9 +7,9 @@ import (
 	"context"
 	"os"
 
-	"github.com/codeGROOVE-dev/bdcache"
-	"github.com/codeGROOVE-dev/bdcache/persist/datastore"
-	"github.com/codeGROOVE-dev/bdcache/persist/localfs"
+	"github.com/codeGROOVE-dev/sfcache"
+	"github.com/codeGROOVE-dev/sfcache/persist/datastore"
+	"github.com/codeGROOVE-dev/sfcache/persist/localfs"
 )
 
 // New creates a persistence layer optimized for Cloud Run environments.
@@ -19,7 +19,7 @@ import (
 //
 // The cacheID is used as the database name for Datastore or subdirectory for local files.
 // This function always succeeds by falling back to local files if Datastore is unavailable.
-func New[K comparable, V any](ctx context.Context, cacheID string) (bdcache.PersistenceLayer[K, V], error) {
+func New[K comparable, V any](ctx context.Context, cacheID string) (sfcache.PersistenceLayer[K, V], error) {
 	// Try Datastore in Cloud Run environments
 	if os.Getenv("K_SERVICE") != "" {
 		p, err := datastore.New[K, V](ctx, cacheID)

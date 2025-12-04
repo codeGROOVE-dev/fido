@@ -1,9 +1,9 @@
-module github.com/codeGROOVE-dev/bdcache/benchmarks
+module github.com/codeGROOVE-dev/sfcache/benchmarks
 
 go 1.25.4
 
 require (
-	github.com/codeGROOVE-dev/bdcache v0.0.0
+	github.com/codeGROOVE-dev/sfcache v0.0.0
 	github.com/coocood/freecache v1.2.4
 	github.com/dgraph-io/ristretto v0.2.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
@@ -19,4 +19,4 @@ require (
 	golang.org/x/sys v0.34.0 // indirect
 )
 
-replace github.com/codeGROOVE-dev/bdcache => ../
+replace github.com/codeGROOVE-dev/sfcache => ../
