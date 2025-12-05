@@ -261,11 +261,11 @@ func (p *store[K, V]) Cleanup(ctx context.Context, maxAge time.Duration) (int, e
 // Flush removes all entries from Datastore.
 // Returns the number of entries removed and any error.
 func (p *store[K, V]) Flush(ctx context.Context) (int, error) {
-	// Query for all keys
+	// Query for all keys (use empty slice for mock compatibility)
 	query := ds.NewQuery(p.kind).KeysOnly()
 
-	var entries []entry
-	keys, err := p.client.GetAll(ctx, query, &entries)
+	var dst []entry
+	keys, err := p.client.GetAll(ctx, query, &dst)
 	if err != nil {
 		return 0, fmt.Errorf("query all entries: %w", err)
 	}
@@ -285,7 +285,8 @@ func (p *store[K, V]) Flush(ctx context.Context) (int, error) {
 // Len returns the number of entries in Datastore.
 func (p *store[K, V]) Len(ctx context.Context) (int, error) {
 	query := ds.NewQuery(p.kind).KeysOnly()
-	keys, err := p.client.GetAll(ctx, query, nil)
+	var dst []entry
+	keys, err := p.client.GetAll(ctx, query, &dst)
 	if err != nil {
 		return 0, fmt.Errorf("query all entries: %w", err)
 	}
