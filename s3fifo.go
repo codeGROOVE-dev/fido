@@ -95,15 +95,15 @@ type shard[K comparable, V any] struct {
 	small   entryList[K, V]    // Intrusive list for small queue
 	main    entryList[K, V]    // Intrusive list for main queue
 
-	// Two-map ghost: tracks evicted keys without linked list overhead.
-	// On swap: clear aging map, swap pointers. Provides approximate FIFO.
-	ghostActive map[K]struct{} // current generation ghost entries
-	ghostAging  map[K]struct{} // previous generation ghost entries
-	ghostCount  int            // entries in active map
+	// Two-map ghost: tracks recently evicted keys with zero false positives.
+	// Two maps rotate to provide approximate FIFO without linked list overhead.
+	// When ghostActive fills up, ghostAging is cleared and they swap roles.
+	ghostActive map[K]struct{} // current generation
+	ghostAging  map[K]struct{} // previous generation (read-only until swap)
+	ghostCap    int            // max entries before rotation
 
 	capacity int
 	smallCap int
-	ghostCap int
 
 	// Free list for reducing allocations
 	freeEntries *entry[K, V]
@@ -218,14 +218,18 @@ func newS3FIFO[K comparable, V any](cfg *config) *s3fifo[K, V] {
 
 	// Auto-tune ratios based on capacity
 	// Note: Two-map ghost tracks 2x ghostRatio total (both maps can be nearly full).
-	// This is intentional - longer ghost history improves promotion decisions.
+	// Ghost ratio sweep results (Meta trace):
+	//   0.5x: 68.15% / 76.05%
+	//   1.0x: 68.42% / 76.27%
+	//   1.5x: 68.53% / 76.34%  <- sweet spot (good hit rate, reasonable memory)
+	//   2.0x: 68.57% / 76.39%  <- diminishing returns
 	var smallRatio, ghostRatio float64
 	if capacity <= 16384 {
 		smallRatio = 0.01 // 1% for small caches (Zipf-friendly)
-		ghostRatio = 0.5  // 50% per map = ~100% total for small caches
+		ghostRatio = 1.0  // 100% per map = ~200% total for small caches
 	} else {
 		smallRatio = 0.05 // 5% for large caches (Meta trace optimal)
-		ghostRatio = 1.0  // 100% per map = ~200% total for large caches
+		ghostRatio = 1.5  // 150% per map = ~300% total for large caches
 	}
 
 	for i := range numShards {
@@ -243,7 +247,7 @@ func newShard[K comparable, V any](capacity int, smallRatio, ghostRatio float64)
 		smallCap = 1
 	}
 
-	// Ghost queue: recommended 100%
+	// Ghost capacity: controls rotation frequency
 	ghostCap := int(float64(capacity) * ghostRatio)
 	if ghostCap < 1 {
 		ghostCap = 1
@@ -377,13 +381,11 @@ func (s *shard[K, V]) set(key K, value V, expiryNano int64) {
 
 	// Slow path: insert new key (already holding lock)
 
-	// Check if key is in ghost (two-map lookup)
+	// Check if key is in ghost (zero false positives)
 	_, inGhost := s.ghostActive[key]
 	if !inGhost {
 		_, inGhost = s.ghostAging[key]
 	}
-	// Note: We don't remove from ghost on hit - the key will naturally age out.
-	// This is acceptable since ghost is just a hint for promotion decisions.
 
 	// Create new entry
 	ent := s.getEntry()
@@ -394,7 +396,11 @@ func (s *shard[K, V]) set(key K, value V, expiryNano int64) {
 
 	// Evict when at capacity (no overflow buffer)
 	for s.small.len+s.main.len >= s.capacity {
-		s.evict()
+		if s.small.len >= s.smallCap {
+			s.evictFromSmall()
+		} else {
+			s.evictFromMain()
+		}
 	}
 
 	// Add to appropriate queue
@@ -431,15 +437,6 @@ func (s *shard[K, V]) delete(key K) {
 
 	delete(s.entries, key)
 	s.putEntry(ent)
-}
-
-// evict removes one entry according to S3-FIFO algorithm.
-func (s *shard[K, V]) evict() {
-	if s.small.len >= s.smallCap {
-		s.evictFromSmall()
-		return
-	}
-	s.evictFromMain()
 }
 
 // evictFromSmall evicts an entry from the small queue.
@@ -487,17 +484,15 @@ func (s *shard[K, V]) evictFromMain() {
 	}
 }
 
-// addToGhost adds a key to the ghost queue.
+// addToGhost adds a key to the ghost queue using two rotating maps.
 func (s *shard[K, V]) addToGhost(key K) {
-	// Add to active generation
 	s.ghostActive[key] = struct{}{}
-	s.ghostCount++
 
-	// Swap generations when active is full (provides approximate FIFO)
-	if s.ghostCount >= s.ghostCap {
+	// Rotate maps when active is full (provides approximate FIFO)
+	if len(s.ghostActive) >= s.ghostCap {
+		// Clear aging map and swap - aging becomes new active
 		clear(s.ghostAging)
-		s.ghostAging, s.ghostActive = s.ghostActive, s.ghostAging
-		s.ghostCount = 0
+		s.ghostActive, s.ghostAging = s.ghostAging, s.ghostActive
 	}
 }
 
@@ -532,6 +527,5 @@ func (s *shard[K, V]) flush() int {
 	s.main.init()
 	clear(s.ghostActive)
 	clear(s.ghostAging)
-	s.ghostCount = 0
 	return n
 }
