@@ -1,4 +1,4 @@
-.PHONY: test lint bench benchmark clean tag release
+.PHONY: test lint bench benchmark clean tag release update
 
 # Tag all modules in the repository with a version
 # Usage: make tag VERSION=v1.2.3
@@ -66,6 +66,11 @@ benchmark:
 
 clean:
 	go clean -testcache
+
+update:
+	@echo "Updating dependencies in all modules..."
+	@find . -name go.mod -execdir go get -u ./... \;
+	@find . -name go.mod -execdir go mod tidy \;
 
 # BEGIN: lint-install .
 # http://github.com/codeGROOVE-dev/lint-install

@@ -3,7 +3,7 @@ module github.com/codeGROOVE-dev/sfcache/benchmarks
 go 1.25.4
 
 require (
-	github.com/codeGROOVE-dev/sfcache v0.0.0
+	github.com/codeGROOVE-dev/sfcache v1.2.0
 	github.com/coocood/freecache v1.2.4
 	github.com/dgraph-io/ristretto v0.2.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
@@ -13,12 +13,11 @@ require (
 )
 
 require (
-	github.com/cespare/xxhash/v2 v2.1.2 // indirect
-	github.com/codeGROOVE-dev/sfcache/pkg/persist v1.1.4 // indirect
+	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+	github.com/codeGROOVE-dev/sfcache/pkg/persist v1.2.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
-	golang.org/x/sync v0.19.0 // indirect
-	golang.org/x/sys v0.34.0 // indirect
+	golang.org/x/sys v0.39.0 // indirect
 )
 
 replace github.com/codeGROOVE-dev/sfcache => ../

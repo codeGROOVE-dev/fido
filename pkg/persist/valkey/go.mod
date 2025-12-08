@@ -3,10 +3,10 @@ module github.com/codeGROOVE-dev/sfcache/pkg/persist/valkey
 go 1.25.4
 
 require (
-	github.com/codeGROOVE-dev/sfcache/pkg/persist v0.0.0
-	github.com/valkey-io/valkey-go v1.0.51
+	github.com/codeGROOVE-dev/sfcache/pkg/persist v1.2.0
+	github.com/valkey-io/valkey-go v1.0.69
 )
 
-require golang.org/x/sys v0.24.0 // indirect
+require golang.org/x/sys v0.39.0 // indirect
 
 replace github.com/codeGROOVE-dev/sfcache/pkg/persist => ..
