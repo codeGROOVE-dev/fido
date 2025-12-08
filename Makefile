@@ -1,4 +1,4 @@
-.PHONY: test lint bench benchmark clean tag
+.PHONY: test lint bench benchmark clean tag release
 
 # Tag all modules in the repository with a version
 # Usage: make tag VERSION=v1.2.3
@@ -32,6 +32,15 @@ tag:
 	@echo "=== Release $(VERSION) complete ==="
 	@echo "Tags pushed:"
 	@git tag -l "$(VERSION)" "*/$(VERSION)" | sed 's/^/  /'
+
+# Create a GitHub release
+# Usage: make release VERSION=v1.2.3
+release: tag
+	@echo ""
+	@echo "Step 5: Creating GitHub release..."
+	@gh release create $(VERSION) --title "$(VERSION)" --notes "Release $(VERSION)"
+	@echo ""
+	@echo "=== GitHub release $(VERSION) created ==="
 
 test:
 	@echo "Running tests in all modules..."
