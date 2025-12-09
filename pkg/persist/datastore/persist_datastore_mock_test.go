@@ -2,7 +2,6 @@ package datastore
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -11,11 +10,11 @@ import (
 )
 
 // newMockDatastorePersist creates a datastore persistence layer with mock client.
-func newMockDatastorePersist[K comparable, V any](t *testing.T) (dp *store[K, V], cleanup func()) {
+func newMockDatastorePersist[K comparable, V any](t *testing.T) (dp *Store[K, V], cleanup func()) {
 	t.Helper()
 	client, cleanup := ds.NewMockClient(t)
 
-	return &store[K, V]{
+	return &Store[K, V]{
 		client: client,
 		kind:   "CacheEntry",
 	}, cleanup
@@ -188,93 +187,6 @@ func TestDatastorePersist_Mock_ComplexValue(t *testing.T) {
 	}
 }
 
-func TestDatastorePersist_Mock_LoadAll(t *testing.T) {
-	dp, cleanup := newMockDatastorePersist[string, int](t)
-	defer cleanup()
-
-	ctx := context.Background()
-
-	// Set multiple entries
-	entries := map[string]int{
-		"key1": 1,
-		"key2": 2,
-		"key3": 3,
-	}
-	for k, v := range entries {
-		if err := dp.Set(ctx, k, v, time.Time{}); err != nil {
-			t.Fatalf("Set %s: %v", k, err)
-		}
-	}
-
-	// Set expired entry
-	if err := dp.Set(ctx, "expired", 99, time.Now().Add(-1*time.Second)); err != nil {
-		t.Fatalf("Set expired: %v", err)
-	}
-
-	// LoadRecent(ctx, 0) - note: this doesn't return entries (by design, see comment in LoadRecent(ctx, 0))
-	// but it should clean up expired entries
-	entryCh, errCh := dp.LoadRecent(ctx, 0)
-
-	// Consume channels
-	for range entryCh {
-		// Should be empty
-	}
-
-	// Check for errors
-	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Fatalf("LoadRecent(ctx, 0) error: %v", err)
-		}
-	default:
-	}
-
-	// Verify non-expired entries still exist
-	for k, v := range entries {
-		val, _, found, err := dp.Get(ctx, k)
-		if err != nil {
-			t.Fatalf("Get %s: %v", k, err)
-		}
-		if !found {
-			t.Errorf("%s not found after LoadRecent(ctx, 0)", k)
-		}
-		if val != v {
-			t.Errorf("Get %s = %d; want %d", k, val, v)
-		}
-	}
-}
-
-func TestDatastorePersist_Mock_LoadAllContextCancellation(t *testing.T) {
-	dp, cleanup := newMockDatastorePersist[string, int](t)
-	defer cleanup()
-
-	baseCtx := context.Background()
-
-	// Set many entries
-	for i := range 100 {
-		if err := dp.Set(baseCtx, string(rune(i)), i, time.Time{}); err != nil {
-			t.Fatalf("Set: %v", err)
-		}
-	}
-
-	// Cancel context during LoadRecent with limit 0
-	ctx, cancel := context.WithCancel(context.Background())
-	entryCh, errCh := dp.LoadRecent(ctx, 0)
-
-	// Cancel immediately
-	cancel()
-
-	// Consume channels
-	for range entryCh {
-	}
-
-	// Should get context cancellation error (may be wrapped)
-	err := <-errCh
-	if err == nil || !errors.Is(err, context.Canceled) {
-		t.Errorf("expected context.Canceled error; got %v", err)
-	}
-}
-
 func TestDatastorePersist_Mock_Close(t *testing.T) {
 	dp, cleanup := newMockDatastorePersist[string, int](t)
 	defer cleanup()
@@ -369,48 +281,6 @@ func TestDatastorePersist_Mock_DeleteNonExistent(t *testing.T) {
 	// Delete non-existent key should not error
 	if err := dp.Delete(ctx, "nonexistent"); err != nil {
 		t.Errorf("Delete nonexistent: %v", err)
-	}
-}
-
-func TestDatastorePersist_Mock_ExpiredInLoadAll(t *testing.T) {
-	dp, cleanup := newMockDatastorePersist[string, int](t)
-	defer cleanup()
-
-	ctx := context.Background()
-
-	// Set entries with different expirations
-	if err := dp.Set(ctx, "valid1", 1, time.Now().Add(1*time.Hour)); err != nil {
-		t.Fatalf("Set valid1: %v", err)
-	}
-	if err := dp.Set(ctx, "valid2", 2, time.Now().Add(1*time.Hour)); err != nil {
-		t.Fatalf("Set valid2: %v", err)
-	}
-	if err := dp.Set(ctx, "expired", 99, time.Now().Add(-1*time.Second)); err != nil {
-		t.Fatalf("Set expired: %v", err)
-	}
-
-	// LoadRecent(ctx, 0) should handle expired entries
-	entryCh, errCh := dp.LoadRecent(ctx, 0)
-
-	for range entryCh {
-		// Entries channel should be empty (LoadRecent(ctx, 0) doesn't return entries by design)
-	}
-
-	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Fatalf("LoadRecent(ctx, 0) error: %v", err)
-		}
-	default:
-	}
-
-	// Verify valid entries still accessible
-	val, _, found, err := dp.Get(ctx, "valid1")
-	if err != nil {
-		t.Fatalf("Get valid1: %v", err)
-	}
-	if !found || val != 1 {
-		t.Errorf("valid1 = %v, %v; want 1, true", val, found)
 	}
 }
 
@@ -551,43 +421,6 @@ func TestDatastorePersist_Mock_CleanupEmpty(t *testing.T) {
 	}
 }
 
-func TestDatastorePersist_Mock_LoadRecentWithLimit(t *testing.T) {
-	dp, cleanup := newMockDatastorePersist[string, int](t)
-	defer cleanup()
-
-	ctx := context.Background()
-
-	// Set multiple entries
-	for i := range 10 {
-		key := string(rune('a' + i))
-		if err := dp.Set(ctx, key, i, time.Time{}); err != nil {
-			t.Fatalf("Store %s: %v", key, err)
-		}
-	}
-
-	// Load recent with limit
-	entryCh, errCh := dp.LoadRecent(ctx, 3)
-
-	loaded := 0
-	for range entryCh {
-		loaded++
-	}
-
-	// Check for errors
-	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Fatalf("LoadRecent error: %v", err)
-		}
-	default:
-	}
-
-	// Should have loaded at most 3 entries
-	if loaded > 3 {
-		t.Errorf("loaded %d entries; want at most 3", loaded)
-	}
-}
-
 func TestDatastorePersist_Mock_Delete_Error(t *testing.T) {
 	dp, cleanup := newMockDatastorePersist[string, int](t)
 	defer cleanup()
@@ -621,57 +454,6 @@ func TestDatastorePersist_Mock_Load_DecodeError(t *testing.T) {
 	}
 	if val != 42 {
 		t.Errorf("Get value = %d; want 42", val)
-	}
-}
-
-func TestDatastorePersist_Mock_LoadRecent_SkipExpired(t *testing.T) {
-	dp, cleanup := newMockDatastorePersist[string, int](t)
-	defer cleanup()
-
-	ctx := context.Background()
-
-	// Set mix of expired and valid entries
-	past := time.Now().Add(-1 * time.Hour)
-	future := time.Now().Add(1 * time.Hour)
-
-	if err := dp.Set(ctx, "expired1", 1, past); err != nil {
-		t.Fatalf("Set: %v", err)
-	}
-	if err := dp.Set(ctx, "expired2", 2, past); err != nil {
-		t.Fatalf("Set: %v", err)
-	}
-	if err := dp.Set(ctx, "valid1", 3, future); err != nil {
-		t.Fatalf("Set: %v", err)
-	}
-	if err := dp.Set(ctx, "valid2", 4, future); err != nil {
-		t.Fatalf("Set: %v", err)
-	}
-
-	// LoadRecent should skip expired
-	entryCh, errCh := dp.LoadRecent(ctx, 0)
-
-	loaded := make(map[string]int)
-	for entry := range entryCh {
-		loaded[entry.Key] = entry.Value
-	}
-
-	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Fatalf("LoadRecent error: %v", err)
-		}
-	default:
-	}
-
-	// Should only have valid entries
-	if len(loaded) != 2 {
-		t.Errorf("loaded %d entries; want 2 (expired should be skipped)", len(loaded))
-	}
-	if loaded["valid1"] != 3 {
-		t.Error("valid1 should be loaded")
-	}
-	if loaded["valid2"] != 4 {
-		t.Error("valid2 should be loaded")
 	}
 }
 

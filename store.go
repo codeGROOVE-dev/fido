@@ -6,6 +6,8 @@ import (
 )
 
 // Store defines the interface for cache persistence backends.
+// Uses only standard library types, so implementations can satisfy it
+// without importing this package.
 type Store[K comparable, V any] interface {
 	// ValidateKey checks if a key is valid for this persistence store.
 	ValidateKey(key K) error
@@ -18,10 +20,6 @@ type Store[K comparable, V any] interface {
 
 	// Delete removes a value from persistent storage.
 	Delete(ctx context.Context, key K) error
-
-	// LoadRecent streams up to limit most recently updated entries.
-	// If limit is 0, returns all entries.
-	LoadRecent(ctx context.Context, limit int) (<-chan Entry[K, V], <-chan error)
 
 	// Cleanup removes expired entries older than maxAge.
 	Cleanup(ctx context.Context, maxAge time.Duration) (int, error)
@@ -37,12 +35,4 @@ type Store[K comparable, V any] interface {
 
 	// Close releases any resources held by the persistence store.
 	Close() error
-}
-
-// Entry represents a cache entry with its metadata.
-type Entry[K comparable, V any] struct {
-	Key       K
-	Value     V
-	Expiry    time.Time
-	UpdatedAt time.Time
 }

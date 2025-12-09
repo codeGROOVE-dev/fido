@@ -2,7 +2,6 @@ package valkey
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -393,73 +392,6 @@ func TestValkeyPersist_ComplexValue(t *testing.T) {
 	}
 }
 
-func TestValkeyPersist_LoadRecent(t *testing.T) {
-	skipIfNoValkey(t)
-
-	ctx := context.Background()
-	addr := os.Getenv("VALKEY_ADDR")
-	if addr == "" {
-		addr = "localhost:6379"
-	}
-
-	p, err := New[string, int](ctx, "test-cache-recent", addr)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	defer func() {
-		if err := p.Close(); err != nil {
-			t.Logf("Close error: %v", err)
-		}
-	}()
-
-	// Set multiple entries
-	entries := map[string]int{
-		"key1": 1,
-		"key2": 2,
-		"key3": 3,
-	}
-	for k, v := range entries {
-		if err := p.Set(ctx, k, v, time.Time{}); err != nil {
-			t.Fatalf("Set %s: %v", k, err)
-		}
-	}
-
-	// Get all
-	entryCh, errCh := p.LoadRecent(ctx, 0)
-
-	loaded := make(map[string]int)
-	for entry := range entryCh {
-		loaded[entry.Key] = entry.Value
-	}
-
-	// Check for errors
-	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Fatalf("LoadRecent error: %v", err)
-		}
-	default:
-	}
-
-	// Verify all entries loaded
-	if len(loaded) != len(entries) {
-		t.Errorf("loaded %d entries; want %d", len(loaded), len(entries))
-	}
-
-	for k, v := range entries {
-		if loaded[k] != v {
-			t.Errorf("loaded[%s] = %d; want %d", k, loaded[k], v)
-		}
-	}
-
-	// Cleanup
-	for k := range entries {
-		if err := p.Delete(ctx, k); err != nil {
-			t.Logf("Delete error: %v", err)
-		}
-	}
-}
-
 func TestValkeyPersist_Location(t *testing.T) {
 	skipIfNoValkey(t)
 
@@ -692,66 +624,6 @@ func TestValkeyPersist_SpecialCharacters(t *testing.T) {
 	}
 }
 
-func TestValkeyPersist_ContextCancellation(t *testing.T) {
-	skipIfNoValkey(t)
-
-	addr := os.Getenv("VALKEY_ADDR")
-	if addr == "" {
-		addr = "localhost:6379"
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	p, err := New[string, int](ctx, "test-cache-cancel", addr)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	defer func() {
-		if err := p.Close(); err != nil {
-			t.Logf("Close error: %v", err)
-		}
-	}()
-
-	// Set some data first
-	for i := range 100 {
-		key := fmt.Sprintf("cancel-key-%d", i)
-		if err := p.Set(ctx, key, i, time.Time{}); err != nil {
-			t.Fatalf("Set: %v", err)
-		}
-	}
-
-	// Cancel context during LoadRecent
-	entryCh, errCh := p.LoadRecent(ctx, 0)
-
-	// Cancel immediately
-	cancel()
-
-	// Try to read entries
-	count := 0
-	for range entryCh {
-		count++
-	}
-
-	// Check for cancellation error
-	select {
-	case err := <-errCh:
-		if err != nil && !errors.Is(err, context.Canceled) {
-			t.Errorf("expected context.Canceled, got: %v", err)
-		}
-	default:
-	}
-
-	t.Logf("loaded %d entries before cancellation", count)
-
-	// Cleanup with new context
-	cleanupCtx := context.Background()
-	for i := range 100 {
-		key := fmt.Sprintf("cancel-key-%d", i)
-		if err := p.Delete(cleanupCtx, key); err != nil {
-			t.Logf("cleanup delete error: %v", err)
-		}
-	}
-}
-
 func TestValkeyPersist_EmptyValues(t *testing.T) {
 	skipIfNoValkey(t)
 
@@ -837,109 +709,6 @@ func TestValkeyPersist_KeyValidation(t *testing.T) {
 	err = p.ValidateKey("")
 	if err == nil {
 		t.Error("expected error for empty key")
-	}
-}
-
-func TestValkeyPersist_LoadRecentWithLimit(t *testing.T) {
-	skipIfNoValkey(t)
-
-	ctx := context.Background()
-	addr := os.Getenv("VALKEY_ADDR")
-	if addr == "" {
-		addr = "localhost:6379"
-	}
-
-	p, err := New[string, int](ctx, "test-cache-limit", addr)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	defer func() {
-		if err := p.Close(); err != nil {
-			t.Logf("Close error: %v", err)
-		}
-	}()
-
-	// Set 10 entries
-	for i := range 10 {
-		key := fmt.Sprintf("limit-key-%d", i)
-		if err := p.Set(ctx, key, i, time.Time{}); err != nil {
-			t.Fatalf("Set %s: %v", key, err)
-		}
-	}
-
-	// Get with limit of 5
-	entryCh, errCh := p.LoadRecent(ctx, 5)
-
-	loaded := 0
-	for range entryCh {
-		loaded++
-	}
-
-	// Check for errors
-	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Fatalf("LoadRecent error: %v", err)
-		}
-	default:
-	}
-
-	// Should have loaded at most 5 entries
-	if loaded > 5 {
-		t.Errorf("loaded %d entries; want at most 5", loaded)
-	}
-	if loaded < 5 {
-		t.Errorf("loaded %d entries; want at least 5", loaded)
-	}
-
-	// Cleanup
-	for i := range 10 {
-		key := fmt.Sprintf("limit-key-%d", i)
-		if err := p.Delete(ctx, key); err != nil {
-			t.Logf("Delete error: %v", err)
-		}
-	}
-}
-
-func TestValkeyPersist_LoadRecentEmpty(t *testing.T) {
-	skipIfNoValkey(t)
-
-	ctx := context.Background()
-	addr := os.Getenv("VALKEY_ADDR")
-	if addr == "" {
-		addr = "localhost:6379"
-	}
-
-	p, err := New[string, int](ctx, "test-cache-empty-recent", addr)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	defer func() {
-		if err := p.Close(); err != nil {
-			t.Logf("Close error: %v", err)
-		}
-	}()
-
-	// Get from empty cache
-	entryCh, errCh := p.LoadRecent(ctx, 0)
-
-	loaded := 0
-	for range entryCh {
-		loaded++
-	}
-
-	// Check for errors
-	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Fatalf("LoadRecent error: %v", err)
-		}
-	default:
-	}
-
-	// Should have loaded 0 entries
-	if loaded != 0 {
-		t.Errorf("loaded %d entries from empty cache; want 0", loaded)
 	}
 }
 

@@ -21,7 +21,8 @@ tag:
 	@echo "Step 3: Create and push tags..."
 	@git tag -a $(VERSION) -m "$(VERSION)" --force
 	@git push origin $(VERSION) --force
-	@find . -name go.mod -not -path "./go.mod" | while read mod; do \
+	@# Push submodule tags in dependency order (cloudrun depends on datastore and localfs)
+	@for mod in $$(find . -name go.mod -not -path "./go.mod" | sort | grep -v cloudrun) $$(find . -name go.mod -path "*/cloudrun/*"); do \
 		dir=$$(dirname $$mod); \
 		dir=$${dir#./}; \
 		echo "  $$dir/$(VERSION)"; \

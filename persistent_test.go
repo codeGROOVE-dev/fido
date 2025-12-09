@@ -98,48 +98,6 @@ func (m *mockStore[K, V]) Delete(ctx context.Context, key K) error {
 	return nil
 }
 
-//nolint:gocritic // Channel returns are clearer without named results
-func (m *mockStore[K, V]) LoadRecent(ctx context.Context, limit int) (<-chan Entry[K, V], <-chan error) {
-	entryCh := make(chan Entry[K, V], 10)
-	errCh := make(chan error, 1)
-
-	go func() {
-		defer close(entryCh)
-		defer close(errCh)
-
-		m.mu.RLock()
-		defer m.mu.RUnlock()
-
-		count := 0
-		for keyStr, entry := range m.data {
-			if limit > 0 && count >= limit {
-				break
-			}
-
-			// Parse key back from string
-			var key K
-			if _, err := fmt.Sscanf(keyStr, "%v", &key); err != nil {
-				// Try direct type assertion for string keys
-				sk, ok := any(keyStr).(K)
-				if !ok {
-					continue
-				}
-				key = sk
-			}
-
-			entryCh <- Entry[K, V]{
-				Key:       key,
-				Value:     entry.value,
-				Expiry:    entry.expiry,
-				UpdatedAt: entry.updatedAt,
-			}
-			count++
-		}
-	}()
-
-	return entryCh, errCh
-}
-
 func (m *mockStore[K, V]) Cleanup(ctx context.Context, maxAge time.Duration) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

@@ -145,71 +145,6 @@ func TestFilePersist_Delete(t *testing.T) {
 	}
 }
 
-func TestFilePersist_LoadAll(t *testing.T) {
-	dir := t.TempDir()
-	fp, err := New[string, int](filepath.Base(dir), filepath.Dir(dir))
-	if err != nil {
-		t.Fatalf("newFilePersist: %v", err)
-	}
-	defer func() {
-		if err := fp.Close(); err != nil {
-			t.Logf("Close error: %v", err)
-		}
-	}()
-
-	ctx := context.Background()
-
-	// Set multiple entries
-	entries := map[string]int{
-		"key1": 1,
-		"key2": 2,
-		"key3": 3,
-	}
-	for k, v := range entries {
-		if err := fp.Set(ctx, k, v, time.Time{}); err != nil {
-			t.Fatalf("Set %s: %v", k, err)
-		}
-	}
-
-	// Set expired entry
-	if err := fp.Set(ctx, "expired", 99, time.Now().Add(-1*time.Second)); err != nil {
-		t.Fatalf("Set expired: %v", err)
-	}
-
-	// Get all
-	entryCh, errCh := fp.LoadRecent(ctx, 0)
-
-	loaded := make(map[string]int)
-	for entry := range entryCh {
-		loaded[entry.Key] = entry.Value
-	}
-
-	// Check for errors
-	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Fatalf("LoadRecent(ctx, 0) error: %v", err)
-		}
-	default:
-	}
-
-	// Verify all non-expired entries loaded
-	if len(loaded) != len(entries) {
-		t.Errorf("loaded %d entries; want %d", len(loaded), len(entries))
-	}
-
-	for k, v := range entries {
-		if loaded[k] != v {
-			t.Errorf("loaded[%s] = %d; want %d", k, loaded[k], v)
-		}
-	}
-
-	// Expired entry should not be loaded
-	if _, ok := loaded["expired"]; ok {
-		t.Error("expired entry should not be loaded")
-	}
-}
-
 func TestFilePersist_Update(t *testing.T) {
 	dir := t.TempDir()
 	fp, err := New[string, string](filepath.Base(dir), filepath.Dir(dir))
@@ -244,44 +179,6 @@ func TestFilePersist_Update(t *testing.T) {
 	}
 	if val != "value2" {
 		t.Errorf("Get value = %s; want value2", val)
-	}
-}
-
-func TestFilePersist_ContextCancellation(t *testing.T) {
-	dir := t.TempDir()
-	fp, err := New[string, int](filepath.Base(dir), filepath.Dir(dir))
-	if err != nil {
-		t.Fatalf("newFilePersist: %v", err)
-	}
-	defer func() {
-		if err := fp.Close(); err != nil {
-			t.Logf("Close error: %v", err)
-		}
-	}() // Set many entries with valid alphanumeric keys
-	ctx := context.Background()
-	for i := range 100 {
-		key := fmt.Sprintf("key%d", i)
-		if err := fp.Set(ctx, key, i, time.Time{}); err != nil {
-			t.Fatalf("Set: %v", err)
-		}
-	}
-
-	// Cancel context during LoadRecent with limit 0
-	ctx, cancel := context.WithCancel(context.Background())
-	entryCh, errCh := fp.LoadRecent(ctx, 0)
-
-	// Read a few entries, then cancel
-	count := 0
-	cancel()
-
-	for range entryCh {
-		count++
-	}
-
-	// Should get context cancellation error
-	err = <-errCh
-	if err == nil || !errors.Is(err, context.Canceled) {
-		t.Errorf("expected context.Canceled error; got %v", err)
 	}
 }
 
@@ -472,50 +369,6 @@ func TestFilePersist_Cleanup(t *testing.T) {
 	}
 }
 
-func TestFilePersist_LoadRecent_WithLimit(t *testing.T) {
-	dir := t.TempDir()
-	fp, err := New[string, int]("test", dir)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	defer func() {
-		if err := fp.Close(); err != nil {
-			t.Logf("Close error: %v", err)
-		}
-	}()
-
-	ctx := context.Background()
-
-	// Set 10 entries
-	for i := range 10 {
-		if err := fp.Set(ctx, fmt.Sprintf("key%d", i), i, time.Time{}); err != nil {
-			t.Fatalf("Set: %v", err)
-		}
-	}
-
-	// Get with limit of 5
-	entryCh, errCh := fp.LoadRecent(ctx, 5)
-
-	loaded := 0
-	for range entryCh {
-		loaded++
-	}
-
-	// Check for errors
-	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Fatalf("LoadRecent error: %v", err)
-		}
-	default:
-	}
-
-	// Should have loaded at most 5 entries
-	if loaded > 5 {
-		t.Errorf("loaded %d entries; want at most 5", loaded)
-	}
-}
-
 func TestFilePersist_Location(t *testing.T) {
 	dir := t.TempDir()
 	fp, err := New[string, int]("test", dir)
@@ -629,41 +482,6 @@ func TestFilePersist_CleanupEmptyDir(t *testing.T) {
 	}
 }
 
-func TestFilePersist_LoadRecent_Empty(t *testing.T) {
-	dir := t.TempDir()
-	fp, err := New[string, int]("test", dir)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	defer func() {
-		if err := fp.Close(); err != nil {
-			t.Logf("Close error: %v", err)
-		}
-	}()
-
-	ctx := context.Background()
-
-	// LoadRecent on empty directory
-	entryCh, errCh := fp.LoadRecent(ctx, 0)
-
-	count := 0
-	for range entryCh {
-		count++
-	}
-
-	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Fatalf("LoadRecent error: %v", err)
-		}
-	default:
-	}
-
-	if count != 0 {
-		t.Errorf("loaded %d entries from empty dir; want 0", count)
-	}
-}
-
 func TestFilePersist_KeyToFilename_Short(t *testing.T) {
 	dir := t.TempDir()
 	fp, err := New[string, int]("test", dir)
@@ -722,7 +540,7 @@ func TestFilePersist_New_UseDefaultCacheDir(t *testing.T) {
 			t.Logf("Close error: %v", err)
 		}
 		// Clean up the test directory from OS cache dir
-		_ = os.RemoveAll(fp.(*store[string, int]).Dir) //nolint:errcheck // Test cleanup
+		_ = os.RemoveAll(fp.Dir) //nolint:errcheck // Test cleanup
 	}()
 
 	ctx := context.Background()
@@ -777,97 +595,6 @@ func TestFilePersist_Store_WithExpiry(t *testing.T) {
 	if loadedExpiry.Sub(expiry).Abs() > time.Second {
 		t.Errorf("expiry = %v; want ~%v", loadedExpiry, expiry)
 	}
-}
-
-func TestFilePersist_LoadRecent_WithExpired(t *testing.T) {
-	dir := t.TempDir()
-	fp, err := New[string, int]("test", dir)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	defer func() {
-		if err := fp.Close(); err != nil {
-			t.Logf("Close error: %v", err)
-		}
-	}()
-
-	ctx := context.Background()
-
-	// Set valid and expired entries
-	if err := fp.Set(ctx, "valid", 1, time.Now().Add(1*time.Hour)); err != nil {
-		t.Fatalf("Set: %v", err)
-	}
-	if err := fp.Set(ctx, "expired", 2, time.Now().Add(-1*time.Hour)); err != nil {
-		t.Fatalf("Set: %v", err)
-	}
-
-	// LoadRecent should skip expired entries
-	entryCh, errCh := fp.LoadRecent(ctx, 0)
-
-	loaded := make(map[string]int)
-	for entry := range entryCh {
-		loaded[entry.Key] = entry.Value
-	}
-
-	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Fatalf("LoadRecent error: %v", err)
-		}
-	default:
-	}
-
-	// Should only have loaded valid entry
-	if len(loaded) != 1 {
-		t.Errorf("loaded %d entries; want 1 (expired should be skipped)", len(loaded))
-	}
-	if loaded["valid"] != 1 {
-		t.Error("valid entry should be loaded")
-	}
-	if _, ok := loaded["expired"]; ok {
-		t.Error("expired entry should not be loaded")
-	}
-}
-
-func TestFilePersist_LoadRecent_ContextCancellation(t *testing.T) {
-	dir := t.TempDir()
-	fp, err := New[string, int]("test", dir)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	defer func() {
-		if err := fp.Close(); err != nil {
-			t.Logf("Close error: %v", err)
-		}
-	}()
-
-	// Set many entries
-	for i := range 100 {
-		if err := fp.Set(context.Background(), fmt.Sprintf("key-%d", i), i, time.Time{}); err != nil {
-			t.Fatalf("Set: %v", err)
-		}
-	}
-
-	// Create context that we'll cancel
-	ctx, cancel := context.WithCancel(context.Background())
-	entryCh, errCh := fp.LoadRecent(ctx, 0)
-
-	// Cancel immediately
-	cancel()
-
-	// Try to read entries
-	count := 0
-	for range entryCh {
-		count++
-	}
-
-	// Should get cancellation error
-	err = <-errCh
-	if err == nil || !errors.Is(err, context.Canceled) {
-		t.Errorf("expected context.Canceled error, got: %v", err)
-	}
-
-	t.Logf("loaded %d entries before cancellation", count)
 }
 
 func TestFilePersist_Cleanup_ContextCancellation(t *testing.T) {
@@ -985,7 +712,7 @@ func TestFilePersist_Flush_RemovesFiles(t *testing.T) {
 	}()
 
 	ctx := context.Background()
-	cacheDir := fp.(*store[string, int]).Dir //nolint:errcheck // Test code - panic is acceptable if type assertion fails
+	cacheDir := fp.Dir
 
 	// Set multiple entries
 	for i := range 10 {

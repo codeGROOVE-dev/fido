@@ -10,7 +10,6 @@ import (
 	"time"
 
 	ds "github.com/codeGROOVE-dev/ds9/pkg/datastore"
-	"github.com/codeGROOVE-dev/sfcache"
 )
 
 const (
@@ -18,15 +17,15 @@ const (
 	maxDatastoreKeyLen = 1500 // Datastore has stricter key length limits
 )
 
-// store implements Store using Google Cloud Datastore.
-type store[K comparable, V any] struct {
+// Store implements persistence using Google Cloud Datastore.
+type Store[K comparable, V any] struct {
 	client *ds.Client
 	kind   string
 }
 
 // ValidateKey checks if a key is valid for Datastore persistence.
 // Datastore has stricter key length limits than files.
-func (*store[K, V]) ValidateKey(key K) error {
+func (*Store[K, V]) ValidateKey(key K) error {
 	s := fmt.Sprintf("%v", key)
 	if len(s) > maxDatastoreKeyLen {
 		return fmt.Errorf("key too long: %d bytes (max %d for datastore)", len(s), maxDatastoreKeyLen)
@@ -40,8 +39,8 @@ func (*store[K, V]) ValidateKey(key K) error {
 // Location returns the Datastore key path for a given cache key.
 // Implements the Store interface Location() method.
 // Format: "kind/key" (e.g., "CacheEntry/mykey").
-func (p *store[K, V]) Location(key K) string {
-	return fmt.Sprintf("%s/%v", p.kind, key)
+func (s *Store[K, V]) Location(key K) string {
+	return fmt.Sprintf("%s/%v", s.kind, key)
 }
 
 // entry represents a cache entry in Datastore.
@@ -56,7 +55,7 @@ type entry struct {
 // New creates a new Datastore-based persistence layer.
 // The cacheID is used as the Datastore database name.
 // An empty projectID will be auto-detected from the environment.
-func New[K comparable, V any](ctx context.Context, cacheID string) (sfcache.Store[K, V], error) {
+func New[K comparable, V any](ctx context.Context, cacheID string) (*Store[K, V], error) {
 	// Empty project ID lets ds9 auto-detect
 	client, err := ds.NewClientWithDatabase(ctx, "", cacheID)
 	if err != nil {
@@ -66,7 +65,7 @@ func New[K comparable, V any](ctx context.Context, cacheID string) (sfcache.Stor
 	// Verify connectivity (assert readiness)
 	// Note: ds9 doesn't expose Ping, but client creation validates connectivity
 
-	return &store[K, V]{
+	return &Store[K, V]{
 		client: client,
 		kind:   datastoreKind,
 	}, nil
@@ -74,19 +73,19 @@ func New[K comparable, V any](ctx context.Context, cacheID string) (sfcache.Stor
 
 // makeKey creates a Datastore key from a cache key.
 // We use the string representation directly as the key name.
-func (p *store[K, V]) makeKey(key K) *ds.Key {
-	return ds.NameKey(p.kind, fmt.Sprintf("%v", key), nil)
+func (s *Store[K, V]) makeKey(key K) *ds.Key {
+	return ds.NameKey(s.kind, fmt.Sprintf("%v", key), nil)
 }
 
 // Get retrieves a value from Datastore.
 //
 //nolint:revive // function-result-limit - required by persist.Store interface
-func (p *store[K, V]) Get(ctx context.Context, key K) (value V, expiry time.Time, found bool, err error) {
+func (s *Store[K, V]) Get(ctx context.Context, key K) (value V, expiry time.Time, found bool, err error) {
 	var zero V
-	dsKey := p.makeKey(key)
+	k := s.makeKey(key)
 
 	var e entry
-	if err := p.client.Get(ctx, dsKey, &e); err != nil {
+	if err := s.client.Get(ctx, k, &e); err != nil {
 		if errors.Is(err, ds.ErrNoSuchEntity) {
 			return zero, time.Time{}, false, nil
 		}
@@ -100,13 +99,13 @@ func (p *store[K, V]) Get(ctx context.Context, key K) (value V, expiry time.Time
 	}
 
 	// Decode from base64
-	vb, err := base64.StdEncoding.DecodeString(e.Value)
+	b, err := base64.StdEncoding.DecodeString(e.Value)
 	if err != nil {
 		return zero, time.Time{}, false, fmt.Errorf("decode base64: %w", err)
 	}
 
 	// Decode value from JSON
-	if err := json.Unmarshal(vb, &value); err != nil {
+	if err := json.Unmarshal(b, &value); err != nil {
 		return zero, time.Time{}, false, fmt.Errorf("unmarshal value: %w", err)
 	}
 
@@ -114,23 +113,22 @@ func (p *store[K, V]) Get(ctx context.Context, key K) (value V, expiry time.Time
 }
 
 // Set saves a value to Datastore.
-func (p *store[K, V]) Set(ctx context.Context, key K, value V, expiry time.Time) error {
-	dsKey := p.makeKey(key)
+func (s *Store[K, V]) Set(ctx context.Context, key K, value V, expiry time.Time) error {
+	k := s.makeKey(key)
 
 	// Encode value as JSON then base64
-	vb, err := json.Marshal(value)
+	b, err := json.Marshal(value)
 	if err != nil {
 		return fmt.Errorf("marshal value: %w", err)
 	}
-	vs := base64.StdEncoding.EncodeToString(vb)
 
 	e := entry{
-		Value:     vs,
+		Value:     base64.StdEncoding.EncodeToString(b),
 		Expiry:    expiry,
 		UpdatedAt: time.Now(),
 	}
 
-	if _, err := p.client.Put(ctx, dsKey, &e); err != nil {
+	if _, err := s.client.Put(ctx, k, &e); err != nil {
 		return fmt.Errorf("datastore put: %w", err)
 	}
 
@@ -138,109 +136,26 @@ func (p *store[K, V]) Set(ctx context.Context, key K, value V, expiry time.Time)
 }
 
 // Delete removes a value from Datastore.
-func (p *store[K, V]) Delete(ctx context.Context, key K) error {
-	dsKey := p.makeKey(key)
-
-	if err := p.client.Delete(ctx, dsKey); err != nil {
+func (s *Store[K, V]) Delete(ctx context.Context, key K) error {
+	if err := s.client.Delete(ctx, s.makeKey(key)); err != nil {
 		return fmt.Errorf("datastore delete: %w", err)
 	}
-
 	return nil
-}
-
-// LoadRecent streams entries from Datastore, returning up to 'limit' most recently updated entries.
-func (p *store[K, V]) LoadRecent(ctx context.Context, limit int) (entries <-chan sfcache.Entry[K, V], errs <-chan error) {
-	entryCh := make(chan sfcache.Entry[K, V], 100)
-	errCh := make(chan error, 1)
-
-	go func() {
-		defer close(entryCh)
-		defer close(errCh)
-
-		// Query ordered by UpdatedAt descending, limited
-		query := ds.NewQuery(p.kind).Order("-updated_at")
-		if limit > 0 {
-			query = query.Limit(limit)
-		}
-
-		iter := p.client.Run(ctx, query)
-		now := time.Now()
-
-		for {
-			var e entry
-			dsKey, err := iter.Next(&e)
-			if errors.Is(err, ds.Done) {
-				break
-			}
-			if err != nil {
-				errCh <- fmt.Errorf("query next: %w", err)
-				return
-			}
-
-			// Check context cancellation
-			select {
-			case <-ctx.Done():
-				errCh <- ctx.Err()
-				return
-			default:
-			}
-
-			// Skip expired entries - cleanup is handled by native TTL or periodic Cleanup() calls
-			if !e.Expiry.IsZero() && now.After(e.Expiry) {
-				continue
-			}
-
-			// Extract key from Datastore entity key name
-			// We need to parse the key string back to type K
-			// For now, we'll use fmt.Sscanf for simple types
-			var key K
-			ks := dsKey.Name
-			if _, err := fmt.Sscanf(ks, "%v", &key); err != nil {
-				// If Sscanf fails, try direct type assertion for string keys
-				sk, ok := any(ks).(K)
-				if !ok {
-					continue
-				}
-				key = sk
-			}
-
-			// Decode value from base64
-			vb, err := base64.StdEncoding.DecodeString(e.Value)
-			if err != nil {
-				continue
-			}
-
-			var value V
-			if err := json.Unmarshal(vb, &value); err != nil {
-				continue
-			}
-
-			entryCh <- sfcache.Entry[K, V]{
-				Key:       key,
-				Value:     value,
-				Expiry:    e.Expiry,
-				UpdatedAt: e.UpdatedAt,
-			}
-		}
-	}()
-
-	return entryCh, errCh
 }
 
 // Cleanup removes expired entries from Datastore.
 // maxAge specifies how old entries must be (based on expiry field) before deletion.
 // If native Datastore TTL is properly configured, this will find no entries.
-func (p *store[K, V]) Cleanup(ctx context.Context, maxAge time.Duration) (int, error) {
+func (s *Store[K, V]) Cleanup(ctx context.Context, maxAge time.Duration) (int, error) {
 	cutoff := time.Now().Add(-maxAge)
 
 	// Query for entries with expiry before cutoff
-	// This finds entries that should have expired based on maxAge
-	query := ds.NewQuery(p.kind).
+	q := ds.NewQuery(s.kind).
 		Filter("expiry >", time.Time{}).
 		Filter("expiry <", cutoff).
 		KeysOnly()
 
-	keys, err := p.client.AllKeys(ctx, query)
+	keys, err := s.client.AllKeys(ctx, q)
 	if err != nil {
 		return 0, fmt.Errorf("query expired keys: %w", err)
 	}
@@ -249,8 +164,7 @@ func (p *store[K, V]) Cleanup(ctx context.Context, maxAge time.Duration) (int, e
 		return 0, nil
 	}
 
-	// Batch delete expired entries
-	if err := p.client.DeleteMulti(ctx, keys); err != nil {
+	if err := s.client.DeleteMulti(ctx, keys); err != nil {
 		return 0, fmt.Errorf("delete expired entries: %w", err)
 	}
 
@@ -259,11 +173,10 @@ func (p *store[K, V]) Cleanup(ctx context.Context, maxAge time.Duration) (int, e
 
 // Flush removes all entries from Datastore.
 // Returns the number of entries removed and any error.
-func (p *store[K, V]) Flush(ctx context.Context) (int, error) {
-	// Query for all keys
-	query := ds.NewQuery(p.kind).KeysOnly()
+func (s *Store[K, V]) Flush(ctx context.Context) (int, error) {
+	q := ds.NewQuery(s.kind).KeysOnly()
 
-	keys, err := p.client.AllKeys(ctx, query)
+	keys, err := s.client.AllKeys(ctx, q)
 	if err != nil {
 		return 0, fmt.Errorf("query all keys: %w", err)
 	}
@@ -272,8 +185,7 @@ func (p *store[K, V]) Flush(ctx context.Context) (int, error) {
 		return 0, nil
 	}
 
-	// Batch delete all entries
-	if err := p.client.DeleteMulti(ctx, keys); err != nil {
+	if err := s.client.DeleteMulti(ctx, keys); err != nil {
 		return 0, fmt.Errorf("delete all entries: %w", err)
 	}
 
@@ -281,16 +193,15 @@ func (p *store[K, V]) Flush(ctx context.Context) (int, error) {
 }
 
 // Len returns the number of entries in Datastore.
-func (p *store[K, V]) Len(ctx context.Context) (int, error) {
-	query := ds.NewQuery(p.kind)
-	count, err := p.client.Count(ctx, query)
+func (s *Store[K, V]) Len(ctx context.Context) (int, error) {
+	n, err := s.client.Count(ctx, ds.NewQuery(s.kind))
 	if err != nil {
 		return 0, fmt.Errorf("count entries: %w", err)
 	}
-	return count, nil
+	return n, nil
 }
 
 // Close releases Datastore client resources.
-func (p *store[K, V]) Close() error {
-	return p.client.Close()
+func (s *Store[K, V]) Close() error {
+	return s.client.Close()
 }

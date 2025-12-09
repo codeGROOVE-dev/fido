@@ -292,40 +292,6 @@ func TestNew_ValidateKey(t *testing.T) {
 	}
 }
 
-func TestNew_LoadRecentEmpty(t *testing.T) {
-	ctx := context.Background()
-
-	p, err := New[string, int](ctx, "test-load-recent-empty")
-	if err != nil {
-		t.Fatalf("New() failed: %v", err)
-	}
-	defer func() {
-		if err := p.Close(); err != nil {
-			t.Logf("Close error: %v", err)
-		}
-	}()
-
-	// LoadRecent on empty cache
-	entryCh, errCh := p.LoadRecent(ctx, 0)
-
-	count := 0
-	for range entryCh {
-		count++
-	}
-
-	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Fatalf("LoadRecent() failed: %v", err)
-		}
-	default:
-	}
-
-	if count != 0 {
-		t.Errorf("LoadRecent() returned %d entries, want 0 for empty cache", count)
-	}
-}
-
 func TestNew_Cleanup(t *testing.T) {
 	ctx := context.Background()
 

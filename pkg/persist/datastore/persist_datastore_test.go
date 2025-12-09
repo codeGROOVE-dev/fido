@@ -5,14 +5,12 @@ import (
 	"os"
 	"testing"
 	"time"
-
-	"github.com/codeGROOVE-dev/sfcache"
 )
 
 // createTestStore creates a store for testing.
 // It tries to use a real Datastore if environment variables are set.
 // Otherwise, it falls back to the mock client from persist_datastore_mock_test.go.
-func createTestStore[K comparable, V any](t *testing.T, ctx context.Context) (store sfcache.Store[K, V], cleanup func()) {
+func createTestStore[K comparable, V any](t *testing.T, ctx context.Context) (dp *Store[K, V], cleanup func()) {
 	t.Helper()
 
 	if os.Getenv("DATASTORE_EMULATOR_HOST") != "" || os.Getenv("GOOGLE_APPLICATION_CREDENTIALS") != "" {
@@ -266,50 +264,6 @@ func TestDatastorePersist_Location(t *testing.T) {
 	// Should contain the kind and key
 	if loc != "CacheEntry/mykey" {
 		t.Errorf("Location() = %q; want %q", loc, "CacheEntry/mykey")
-	}
-}
-
-func TestDatastorePersist_LoadRecent(t *testing.T) {
-	ctx := context.Background()
-	dp, cleanup := createTestStore[string, int](t, ctx)
-	defer cleanup()
-
-	// Set multiple entries
-	for i := range 5 {
-		key := "test-" + string(rune('a'+i))
-		if err := dp.Set(ctx, key, i, time.Time{}); err != nil {
-			t.Fatalf("Set %s: %v", key, err)
-		}
-	}
-
-	// Load recent with limit
-	entryCh, errCh := dp.LoadRecent(ctx, 3)
-
-	loaded := 0
-	for range entryCh {
-		loaded++
-	}
-
-	// Check for errors
-	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Fatalf("LoadRecent error: %v", err)
-		}
-	default:
-	}
-
-	// Should have loaded at most 3 entries
-	if loaded > 3 {
-		t.Errorf("loaded %d entries; want at most 3", loaded)
-	}
-
-	// Cleanup
-	for i := range 5 {
-		key := "test-" + string(rune('a'+i))
-		if err := dp.Delete(ctx, key); err != nil {
-			t.Logf("Delete error: %v", err)
-		}
 	}
 }
 
