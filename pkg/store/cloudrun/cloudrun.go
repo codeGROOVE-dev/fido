@@ -8,6 +8,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/codeGROOVE-dev/sfcache/pkg/store/compress"
 	"github.com/codeGROOVE-dev/sfcache/pkg/store/datastore"
 	"github.com/codeGROOVE-dev/sfcache/pkg/store/localfs"
 )
@@ -29,11 +30,12 @@ type Store[K comparable, V any] interface {
 // New creates a persistence layer for Cloud Run environments.
 // In Cloud Run: tries Datastore, falls back to local files on error.
 // Outside Cloud Run: uses local files directly.
-func New[K comparable, V any](ctx context.Context, cacheID string) (Store[K, V], error) {
+// Optional compressor enables compression (e.g., compress.S2() for Snappy-compatible).
+func New[K comparable, V any](ctx context.Context, cacheID string, c ...compress.Compressor) (Store[K, V], error) {
 	if os.Getenv("K_SERVICE") != "" {
-		if p, err := datastore.New[K, V](ctx, cacheID); err == nil {
+		if p, err := datastore.New[K, V](ctx, cacheID, c...); err == nil {
 			return p, nil
 		}
 	}
-	return localfs.New[K, V](cacheID, "")
+	return localfs.New[K, V](cacheID, "", c...)
 }

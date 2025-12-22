@@ -6,6 +6,8 @@ package null
 import (
 	"context"
 	"time"
+
+	"github.com/codeGROOVE-dev/sfcache/pkg/store/compress"
 )
 
 // Store implements a no-op persistence store.
@@ -13,7 +15,8 @@ import (
 type Store[K comparable, V any] struct{}
 
 // New creates a new null store.
-func New[K comparable, V any]() *Store[K, V] {
+// Optional compressor is accepted for API consistency but ignored.
+func New[K comparable, V any](_ ...compress.Compressor) *Store[K, V] {
 	return &Store[K, V]{}
 }
 
