@@ -119,11 +119,13 @@ type shard[K comparable, V any] struct {
 	// Warmup: during initial fill, admit everything without eviction checks
 	warmupComplete bool
 
-	// Adaptive ghost rate detection: switch to pure recency if ghost hit rate < 5%
-	// This handles scan-heavy workloads automatically
+	// Adaptive mode detection based on ghost hit rate:
+	// - Mode 0 (scan-heavy, ghost rate < 2%): pure recency, skip ghost tracking
+	// - Mode 1 (balanced, ghost rate 2-5%): lenient promotion (freq > 0)
+	// - Mode 2 (frequency-heavy, ghost rate > 5%): strict promotion (freq > 1)
 	insertions            uint32
 	ghostHits             uint32
-	adaptiveRecency       bool   // current mode (true=pure recency)
+	adaptiveMode          uint8  // 0=scan/recency, 1=balanced, 2=frequency-heavy
 	adaptiveMinInsertions uint32 // min insertions before adaptive kicks in
 
 	// Parent pointer for global capacity tracking
@@ -278,6 +280,7 @@ func newS3FIFO[K comparable, V any](cfg *config) *s3fifo[K, V] {
 	for i := range nshards {
 		smallCap := max(int(float64(shardCap)*smallRatio), 1)
 		ghostCap := max(int(float64(shardCap)*ghostRatio), 1)
+		minIns := uint32(max(shardCap, 256)) //nolint:gosec // G115: shardCap bounded by capacity/nshards
 		cache.shards[i] = &shard[K, V]{
 			capacity:              shardCap,
 			smallCap:              smallCap,
@@ -286,7 +289,8 @@ func newS3FIFO[K comparable, V any](cfg *config) *s3fifo[K, V] {
 			ghostActive:           newBloomFilter(ghostCap, 0.00001),
 			ghostAging:            newBloomFilter(ghostCap, 0.00001),
 			hasher:                hasher,
-			adaptiveMinInsertions: uint32(max(shardCap, 256)), //nolint:gosec // G115: shardCap bounded by capacity/nshards
+			adaptiveMinInsertions: minIns,
+			adaptiveMode:          1, // Start in balanced mode
 			parent:                cache,
 		}
 	}
@@ -487,29 +491,44 @@ func (s *shard[K, V]) set(key K, value V, expiryNano int64) {
 	// Lazily check ghost only if at capacity (when eviction matters)
 	// This saves 2× bloom filter checks + hash computation when cache isn't full
 	if atCapacity {
-		// Track insertions for adaptive ghost rate detection
+		// Track insertions for adaptive mode detection
 		s.insertions++
 
-		// Check if key is in ghost (Bloom filter)
-		h := s.hasher(key)
-		inGhost := s.ghostActive.Contains(h) || s.ghostAging.Contains(h)
-		ent.inSmall = !inGhost
+		// In scan/recency mode (mode=0), skip ghost checks entirely
+		if s.adaptiveMode == 0 {
+			ent.inSmall = true
+		} else {
+			// Check if key is in ghost (Bloom filter)
+			h := s.hasher(key)
+			inGhost := s.ghostActive.Contains(h) || s.ghostAging.Contains(h)
+			ent.inSmall = !inGhost
 
-		// Track ghost hits
-		if inGhost {
-			s.ghostHits++
+			// Track ghost hits and apply frequency boost
+			if inGhost {
+				s.ghostHits++
+				// Ghost Freq Boost: Items returning from ghost start with freq=2
+				// This rewards items that proved popularity through the evict-return cycle
+				ent.freq.Store(2)
+			}
 		}
 
-		// Adaptive ghost rate detection: check every 256 insertions
-		// Switch to pure recency if ghost hit rate < 5% (scan-heavy workload)
+		// Adaptive mode detection: check every 256 insertions after warmup
+		// Mode 0: scan-heavy (ghost rate < 2%) - pure recency, skip ghost
+		// Mode 1: balanced (ghost rate 2-5%) - lenient promotion (freq > 0)
+		// Mode 2: frequency-heavy (ghost rate > 5%) - strict promotion (freq > 1)
 		if s.insertions >= s.adaptiveMinInsertions && s.insertions&0xFF == 0 {
-			s.adaptiveRecency = s.ghostHits*20 < s.insertions
-		}
-
-		// Ghost Freq Boost: Items entering Main from ghost start with freq=1
-		// This rewards items that proved popularity through the evict-return cycle
-		if !ent.inSmall {
-			ent.freq.Store(1)
+			ghostRate := s.ghostHits * 100 / s.insertions // percentage
+			switch {
+			case ghostRate < 2:
+				s.adaptiveMode = 0 // Scan-heavy: use pure recency
+			case ghostRate < 5:
+				s.adaptiveMode = 1 // Balanced: lenient promotion
+			default:
+				s.adaptiveMode = 2 // Frequency-heavy: strict promotion
+			}
+			// Reset counters for next period
+			s.insertions = 0
+			s.ghostHits = 0
 		}
 
 		// Evict one entry to make room
@@ -571,41 +590,36 @@ func (s *shard[K, V]) delete(key K) {
 }
 
 // evictFromSmall evicts an entry from the small queue.
-// Items accessed more than once (freq > threshold) are promoted to Main,
-// items with insufficient frequency are evicted to ghost queue.
+// Promotion threshold adapts based on workload characteristics:
+// - Mode 0 (scan): always promote (pure recency)
+// - Mode 1 (balanced): need freq > 0 (one access)
+// - Mode 2 (frequency): need freq > 1 (two accesses)
 func (s *shard[K, V]) evictFromSmall() {
 	mainCap := (s.capacity * 9) / 10 // 90% for main queue
 
-	// Determine promotion threshold:
-	// - If adaptive detection found scan-heavy workload, use pure recency (always promote)
-	// - Otherwise, adaptive based on pressure: need freq>1 normally, freq>0 under pressure
-	var thresh uint32
-	switch {
-	case s.adaptiveRecency:
-		thresh = 0 // Always promote (pure recency mode for scan-heavy)
-	case s.small.len > (s.smallCap*4)/5:
-		thresh = 1 // Under pressure: need freq > 0
-	default:
-		thresh = 2 // Normal: need freq > 1
-	}
+	// Adaptive promotion threshold based on detected workload type
+	thresh := uint32(s.adaptiveMode) // 0, 1, or 2
 
 	for s.small.len > 0 {
 		e := s.small.head
 		s.small.remove(e)
 
 		if e.freq.Load() < thresh {
-			// Not accessed enough - evict and track in ghost
+			// Not accessed enough - evict
 			delete(s.entries, e.key)
 
-			// Add to ghost queue using two rotating Bloom filters
-			h := s.hasher(e.key)
-			if !s.ghostActive.Contains(h) {
-				s.ghostActive.Add(h)
-			}
-			// Rotate filters when active is full (provides approximate FIFO)
-			if s.ghostActive.entries >= s.ghostCap {
-				s.ghostAging.Reset()
-				s.ghostActive, s.ghostAging = s.ghostAging, s.ghostActive
+			// Track in ghost queue only if not in scan/recency mode
+			// (scan-heavy workloads don't benefit from ghost tracking)
+			if s.adaptiveMode > 0 {
+				h := s.hasher(e.key)
+				if !s.ghostActive.Contains(h) {
+					s.ghostActive.Add(h)
+				}
+				// Rotate filters when active is full (provides approximate FIFO)
+				if s.ghostActive.entries >= s.ghostCap {
+					s.ghostAging.Reset()
+					s.ghostActive, s.ghostAging = s.ghostAging, s.ghostActive
+				}
 			}
 
 			s.putEntry(e)
