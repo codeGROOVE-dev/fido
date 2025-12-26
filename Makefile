@@ -1,4 +1,4 @@
-.PHONY: test lint bench benchmark clean tag release update
+.PHONY: test lint bench benchmark competitive-benchmark clean tag release update
 
 # Tag all modules in the repository with a version
 # Usage: make tag VERSION=v1.2.3
@@ -64,15 +64,12 @@ lint:
 bench:
 	go test -bench=. -benchmem
 
-# Run the 5 key benchmarks (~3-5min):
-# 1. Single-Threaded Latency
-# 2. Zipf Throughput (1 thread)
-# 3. Zipf Throughput (16 threads)
-# 4. Meta Trace Hit Rate (real-world)
-# 5. Zipf Hit Rate (synthetic)
+# Run benchmarks via gocachemark
 benchmark:
-	@echo "=== multicache Benchmark Suite ==="
-	@cd benchmarks && go test -run=TestBenchmarkSuite -v -timeout=300s
+	go run ./benchmarks/runner.go
+
+competitive-benchmark:
+	go run ./benchmarks/runner.go -competitive
 
 clean:
 	go clean -testcache
