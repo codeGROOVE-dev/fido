@@ -73,6 +73,32 @@ type s3fifo[K comparable, V any] struct {
 	capacity     int
 }
 
+// ghostFreqRing is a fixed-size ring buffer for ghost frequency tracking.
+// Replaces map[uint64]uint32 to eliminate allocation during ghost rotation.
+// 256 entries with uint8 wrapping = zero-cost modulo.
+// Improves: -5.1% string latency, -44.5% memory (119 → 66 bytes/item).
+// See experiment_results.md Phase 20, Exp A for details.
+type ghostFreqRing struct {
+	hashes [256]uint64
+	freqs  [256]uint32
+	pos    uint8
+}
+
+func (r *ghostFreqRing) add(h uint64, freq uint32) {
+	r.hashes[r.pos] = h
+	r.freqs[r.pos] = freq
+	r.pos++ // uint8 wraps at 256
+}
+
+func (r *ghostFreqRing) lookup(h uint64) (uint32, bool) {
+	for i := range r.hashes {
+		if r.hashes[i] == h {
+			return r.freqs[i], true
+		}
+	}
+	return 0, false
+}
+
 // shard is one partition of the cache. Each has its own lock and queues.
 //
 //nolint:govet // fieldalignment: padding prevents false sharing
@@ -84,12 +110,11 @@ type shard[K comparable, V any] struct {
 	main    entryList[K, V]
 
 	// Ghost uses two rotating bloom filters for approximate FIFO eviction tracking.
-	ghostActive     *bloomFilter
-	ghostAging      *bloomFilter
-	ghostFreqActive map[uint64]uint32 // freq at eviction, for restoring returning keys
-	ghostFreqAging  map[uint64]uint32
-	ghostCap        int
-	hasher          func(K) uint64
+	ghostActive  *bloomFilter
+	ghostAging   *bloomFilter
+	ghostFreqRng ghostFreqRing // ring buffer for ghost frequencies (replaces maps)
+	ghostCap     int
+	hasher       func(K) uint64
 
 	// Death row: small buffer of recently evicted items for instant resurrection.
 	// Improves: +0.04% meta/tencentPhoto, +0.03% wikipedia, +8% set throughput.
@@ -152,6 +177,7 @@ type entry[K comparable, V any] struct {
 	value      V
 	prev       *entry[K, V]
 	next       *entry[K, V]
+	hash       uint64        // cached key hash, avoids re-hashing on eviction (Phase 20, Exp B)
 	expiryNano int64         // 0 means no expiry
 	freq       atomic.Uint32 // access count, capped at maxFreq
 	peakFreq   atomic.Uint32 // max freq seen, for ghost restore
@@ -234,16 +260,14 @@ func newS3FIFO[K comparable, V any](cfg *config) *s3fifo[K, V] {
 	for i := range nshards {
 		ghostCap := max(int(float64(shardCap)*ghostRatio), 1)
 		cache.shards[i] = &shard[K, V]{
-			capacity:        shardCap,
-			smallThresh:     shardCap * 247 / 1000, // 24.7% - tuned via sweep from 10-35% to maximize wins across production traces
-			ghostCap:        ghostCap,
-			entries:         make(map[K]*entry[K, V], shardCap),
-			ghostActive:     newBloomFilter(ghostCap, 0.00001),
-			ghostAging:      newBloomFilter(ghostCap, 0.00001),
-			ghostFreqActive: make(map[uint64]uint32, ghostCap),
-			ghostFreqAging:  make(map[uint64]uint32, ghostCap),
-			hasher:          hasher,
-			parent:          cache,
+			capacity:    shardCap,
+			smallThresh: shardCap * 247 / 1000, // 24.7% - tuned via sweep from 10-35% to maximize wins across production traces
+			ghostCap:    ghostCap,
+			entries:     make(map[K]*entry[K, V], shardCap),
+			ghostActive: newBloomFilter(ghostCap, 0.00001),
+			ghostAging:  newBloomFilter(ghostCap, 0.00001),
+			hasher:      hasher,
+			parent:      cache,
 		}
 	}
 
@@ -265,6 +289,7 @@ func (s *shard[K, V]) freeEntry(e *entry[K, V]) {
 	var zv V
 	e.key = zk
 	e.value = zv
+	e.hash = 0
 	e.expiryNano = 0
 	e.freq.Store(0)
 	e.peakFreq.Store(0)
@@ -462,6 +487,15 @@ func (s *shard[K, V]) setWithHash(key K, value V, expiryNano int64, hash uint64)
 	ent.value = value
 	ent.expiryNano = expiryNano
 
+	// Compute and cache hash for fast eviction.
+	// Avoids re-hashing string keys on eviction path.
+	// See experiment_results.md Phase 20, Exp B for details.
+	h := hash
+	if h == 0 {
+		h = s.hasher(key)
+	}
+	ent.hash = h
+
 	full := s.parent.totalEntries.Load() >= int64(s.parent.capacity)
 
 	// During warmup, skip eviction logic.
@@ -477,10 +511,6 @@ func (s *shard[K, V]) setWithHash(key K, value V, expiryNano int64, hash uint64)
 
 	// Only check ghost when full (saves bloom lookups during fill).
 	if full {
-		h := hash
-		if h == 0 {
-			h = s.hasher(key)
-		}
 		inGhost := s.ghostActive.Contains(h) || s.ghostAging.Contains(h)
 		ent.inSmall = !inGhost
 
@@ -488,10 +518,7 @@ func (s *shard[K, V]) setWithHash(key K, value V, expiryNano int64, hash uint64)
 		// Improves: +0.37% zipf, +0.05% meta, +0.04% tencentPhoto, +0.03% wikipedia.
 		// See experiment_results.md Phase 19, Exp C for details.
 		if !ent.inSmall {
-			if peak, ok := s.ghostFreqActive[h]; ok {
-				ent.freq.Store(peak)
-				ent.peakFreq.Store(peak)
-			} else if peak, ok := s.ghostFreqAging[h]; ok {
+			if peak, ok := s.ghostFreqRng.lookup(h); ok {
 				ent.freq.Store(peak)
 				ent.peakFreq.Store(peak)
 			}
@@ -542,19 +569,17 @@ func (s *shard[K, V]) delete(key K) {
 }
 
 // addToGhost records an evicted key for future admission decisions.
-func (s *shard[K, V]) addToGhost(key K, peakFreq uint32) {
-	h := s.hasher(key)
+// Uses cached hash from entry to avoid re-hashing.
+func (s *shard[K, V]) addToGhost(h uint64, peakFreq uint32) {
 	if !s.ghostActive.Contains(h) {
 		s.ghostActive.Add(h)
 		if peakFreq >= 2 {
-			s.ghostFreqActive[h] = peakFreq
+			s.ghostFreqRng.add(h, peakFreq)
 		}
 	}
 	if s.ghostActive.entries >= s.ghostCap {
 		s.ghostAging.Reset()
-		s.ghostFreqAging = make(map[uint64]uint32, s.ghostCap)
 		s.ghostActive, s.ghostAging = s.ghostAging, s.ghostActive
-		s.ghostFreqActive, s.ghostFreqAging = s.ghostFreqAging, s.ghostFreqActive
 	}
 }
 
@@ -622,7 +647,7 @@ func (s *shard[K, V]) sendToDeathRow(e *entry[K, V]) {
 	// If death row slot is occupied, truly evict that entry first.
 	if old := s.deathRow[s.deathRowPos]; old != nil {
 		delete(s.entries, old.key)
-		s.addToGhost(old.key, old.peakFreq.Load())
+		s.addToGhost(old.hash, old.peakFreq.Load()) // use cached hash
 		old.onDeathRow = false
 		s.freeEntry(old)
 	}
@@ -664,7 +689,6 @@ func (s *shard[K, V]) flush() int {
 	s.main.head, s.main.tail, s.main.len = nil, nil, 0
 	s.ghostActive.Reset()
 	s.ghostAging.Reset()
-	s.ghostFreqActive = make(map[uint64]uint32, s.ghostCap)
-	s.ghostFreqAging = make(map[uint64]uint32, s.ghostCap)
+	s.ghostFreqRng = ghostFreqRing{} // zero value reset
 	return n
 }

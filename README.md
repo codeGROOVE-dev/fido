@@ -91,8 +91,10 @@ This implementation adds:
 - **Extended frequency cap** - max freq=7 vs paper's 3; +0.9% meta, +0.8% zipf
 - **Hot item demotion** - items that were once hot (freq≥4) get demoted to small queue instead of evicted; +0.24% zipf
 - **Death row buffer** - 8-entry buffer per shard holds recently evicted items for instant resurrection; +0.04% meta/tencentPhoto, +0.03% wikipedia, +8% set throughput
+- **Ghost frequency ring buffer** - fixed-size 256-entry ring replaces map allocations; -5.1% string latency, -44.5% memory
+- **Cached entry hash** - hash computed once at set, reused on eviction; eliminates re-hashing overhead
 
-The ghost queue bloom filters and frequency maps add ~80 bytes/item overhead compared to CLOCK (119 vs 38 bytes/item)
+Memory overhead is ~66 bytes/item (vs 38 for CLOCK, 119 for map-based ghost tracking)
 
 Details: [s3fifo.com](https://s3fifo.com/)
 
