@@ -58,24 +58,24 @@ All backends support S2 or Zstd compression via `pkg/store/compress`.
 
 ## Performance
 
-[gocachemark](https://github.com/tstromberg/gocachemark) compares 15 cache libraries across hit rate, latency, throughput, and memory. Composite scores (Dec 2025):
+[gocachemark](https://github.com/tstromberg/gocachemark) compares cache libraries across hit rate, latency, throughput, and memory. Overall scores (Dec 2025):
 
 ```
-#1  multicache   132 points
-#2  otter         51 points
-#3  2q            47 points
+#1  multicache   160 points (13 gold, 3 silver, 1 bronze)
+#2  otter         80 points
+#3  clock         70 points
 ```
 
 Where multicache wins:
 
-- **Throughput**: 6x faster than otter at 32 threads (Get/Set)
-- **Hit rate**: +4% vs LRU on Meta's KVCache trace
-- **Latency**: 7ns Get, zero allocations
+- **Hit rate**: Wins 6 of 9 production traces. +4.9% on Meta, +4.1% on Tencent Photo, +1.6% on Wikipedia
+- **Throughput**: 12x faster Set, 1.6x faster Get vs otter at 32 threads
+- **Latency**: 9-11ns Get, zero allocations
 
 Where others win:
 
-- **Memory**: otter and freecache use less memory per entry
-- **Some traces**: LRU beats S3-FIFO on purely temporal workloads
+- **Memory**: freelru and otter use less memory per entry
+- **Some traces**: CLOCK/LRU marginally better on purely temporal workloads (IBM Docker, Thesios)
 
 Run `make bench` or see gocachemark for full results.
 

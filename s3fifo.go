@@ -4,10 +4,11 @@ import (
 	"fmt"
 	"math/bits"
 	"runtime"
-	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
+
+	"github.com/puzpuzpuz/xsync/v3"
 )
 
 // wyhash constants.
@@ -65,7 +66,7 @@ const maxFreq = 7
 type s3fifo[K comparable, V any] struct {
 	shards       []*shard[K, V]
 	numShards    int
-	shardMask    uint64 // numShards-1 for fast modulo
+	shardMask    uint64 // numShards-1 for fast modulo (power-of-2 only)
 	keyIsInt     bool
 	keyIsInt64   bool
 	keyIsString  bool
@@ -101,11 +102,16 @@ func (r *ghostFreqRing) lookup(h uint64) (uint32, bool) {
 
 // shard is one partition of the cache. Each has its own lock and queues.
 //
+// Uses xsync.RBMutex (reader-biased, BRAVO algorithm) for write operations and
+// xsync.MapOf (CLHT-based) for lock-free reads.
+// Benchmarked: +191% string-get, +158% getorset, +412% int-get throughput.
+// See experiment_results.md Phase 23 for details.
+//
 //nolint:govet // fieldalignment: padding prevents false sharing
 type shard[K comparable, V any] struct {
-	mu      sync.RWMutex
-	_       [40]byte // pad to cache line
-	entries map[K]*entry[K, V]
+	mu      *xsync.RBMutex                // reader-biased mutex for write operations
+	_       [32]byte                      // pad to cache line
+	entries *xsync.MapOf[K, *entry[K, V]] // lock-free concurrent map
 	small   entryList[K, V]
 	main    entryList[K, V]
 
@@ -123,9 +129,8 @@ type shard[K comparable, V any] struct {
 	deathRowPos int             // next slot to use
 
 	capacity       int
-	smallThresh    int          // adaptive small queue threshold
-	freeEntries    *entry[K, V] // reuse pool
-	warmupComplete bool         // skip eviction until first fill
+	smallThresh    int // adaptive small queue threshold
+	warmupComplete bool
 	parent         *s3fifo[K, V]
 }
 
@@ -186,243 +191,195 @@ type entry[K comparable, V any] struct {
 }
 
 func newS3FIFO[K comparable, V any](cfg *config) *s3fifo[K, V] {
-	capacity := cfg.size
-	if capacity <= 0 {
-		capacity = 16384
+	size := cfg.size
+	if size <= 0 {
+		size = 16384
 	}
 
-	// Sharding reduces RWMutex contention at high thread counts.
-	// At 32 threads: 21x throughput improvement for Get, 6x for Set vs single shard.
-	// Formula: max(GOMAXPROCS*16, capacity/256) balances shard count vs S3-FIFO queue size.
-	targetShards := max(runtime.GOMAXPROCS(0)*16, capacity/256)
-	const minEntriesPerShard = 1024 // fewer entries per shard hurts S3-FIFO eviction accuracy
-	maxByCapacity := max(1, capacity/minEntriesPerShard)
-	nshards := min(targetShards, maxByCapacity, maxShards)
-	//nolint:gosec // G115: nshards bounded by [1, maxShards]
-	nshards = 1 << (bits.Len(uint(nshards)) - 1) // round to power of 2
+	// Sharding reduces lock contention at high thread counts.
+	// Formula: max(GOMAXPROCS*16, size/256) balances shard count vs S3-FIFO queue size.
+	n := min(max(runtime.GOMAXPROCS(0)*16, size/256), max(1, size/1024), maxShards)
+	//nolint:gosec // G115: n bounded by [1, maxShards]
+	n = 1 << (bits.Len(uint(n)) - 1) // round to power of 2
+	scap := (size + n - 1) / n       // per-shard capacity
 
-	shardCap := (capacity + nshards - 1) / nshards
-
-	cache := &s3fifo[K, V]{
-		shards:    make([]*shard[K, V], nshards),
-		numShards: nshards,
-		//nolint:gosec // G115: nshards bounded by [1, maxShards]
-		shardMask: uint64(nshards - 1),
-		capacity:  capacity,
+	c := &s3fifo[K, V]{
+		shards:    make([]*shard[K, V], n),
+		numShards: n,
+		//nolint:gosec // G115: n bounded by [1, maxShards]
+		shardMask: uint64(n - 1),
+		capacity:  size,
 	}
 
 	// Detect key type once to avoid type switch on every operation.
 	var zk K
 	switch any(zk).(type) {
 	case int:
-		cache.keyIsInt = true
+		c.keyIsInt = true
 	case int64:
-		cache.keyIsInt64 = true
+		c.keyIsInt64 = true
 	case string:
-		cache.keyIsString = true
+		c.keyIsString = true
 	}
-
-	const ghostRatio = 1.0 // ghost size as fraction of shard capacity
 
 	var hasher func(K) uint64
 	switch {
-	case cache.keyIsInt:
-		hasher = func(key K) uint64 {
-			return hashInt64(int64(*(*int)(unsafe.Pointer(&key))))
+	case c.keyIsInt:
+		hasher = func(k K) uint64 {
+			return hashInt64(int64(*(*int)(unsafe.Pointer(&k))))
 		}
-	case cache.keyIsInt64:
-		hasher = func(key K) uint64 {
-			return hashInt64(*(*int64)(unsafe.Pointer(&key)))
+	case c.keyIsInt64:
+		hasher = func(k K) uint64 {
+			return hashInt64(*(*int64)(unsafe.Pointer(&k)))
 		}
-	case cache.keyIsString:
-		hasher = func(key K) uint64 {
-			return wyhashString(*(*string)(unsafe.Pointer(&key)))
+	case c.keyIsString:
+		hasher = func(k K) uint64 {
+			return wyhashString(*(*string)(unsafe.Pointer(&k)))
 		}
 	default:
-		hasher = func(key K) uint64 {
-			switch k := any(key).(type) {
+		hasher = func(k K) uint64 {
+			switch v := any(k).(type) {
 			case uint:
 				//nolint:gosec // G115: intentional bit reinterpretation for hashing
-				return hashInt64(int64(k))
+				return hashInt64(int64(v))
 			case uint64:
 				//nolint:gosec // G115: intentional bit reinterpretation for hashing
-				return hashInt64(int64(k))
+				return hashInt64(int64(v))
 			case string:
-				return wyhashString(k)
+				return wyhashString(v)
 			case fmt.Stringer:
-				return wyhashString(k.String())
+				return wyhashString(v.String())
 			default:
 				return wyhashString(fmt.Sprintf("%v", k))
 			}
 		}
 	}
 
-	for i := range nshards {
-		ghostCap := max(int(float64(shardCap)*ghostRatio), 1)
-		cache.shards[i] = &shard[K, V]{
-			capacity:    shardCap,
-			smallThresh: shardCap * 247 / 1000, // 24.7% - tuned via sweep from 10-35% to maximize wins across production traces
-			ghostCap:    ghostCap,
-			entries:     make(map[K]*entry[K, V], shardCap),
-			ghostActive: newBloomFilter(ghostCap, 0.00001),
-			ghostAging:  newBloomFilter(ghostCap, 0.00001),
+	for i := range n {
+		c.shards[i] = &shard[K, V]{
+			mu:          xsync.NewRBMutex(),
+			entries:     xsync.NewMapOf[K, *entry[K, V]](xsync.WithPresize(scap)),
+			capacity:    scap,
+			smallThresh: scap * 247 / 1000, // 24.7% tuned via sweep
+			ghostCap:    scap,
+			ghostActive: newBloomFilter(scap, 0.00001),
+			ghostAging:  newBloomFilter(scap, 0.00001),
 			hasher:      hasher,
-			parent:      cache,
+			parent:      c,
 		}
 	}
 
-	return cache
+	return c
 }
 
-func (s *shard[K, V]) allocEntry() *entry[K, V] {
-	if s.freeEntries != nil {
-		e := s.freeEntries
-		s.freeEntries = e.next
-		e.next, e.prev = nil, nil
-		return e
-	}
-	return &entry[K, V]{}
-}
-
-func (s *shard[K, V]) freeEntry(e *entry[K, V]) {
-	var zk K
-	var zv V
-	e.key = zk
-	e.value = zv
-	e.hash = 0
-	e.expiryNano = 0
-	e.freq.Store(0)
-	e.peakFreq.Store(0)
-	e.inSmall = false
-	e.onDeathRow = false
-	e.prev = nil
-	e.next = s.freeEntries
-	s.freeEntries = e
+// shardIdx returns the shard index for a hash value.
+func (c *s3fifo[K, V]) shardIdx(h uint64) int {
+	//nolint:gosec // G115: result bounded by numShards
+	return int(h & c.shardMask)
 }
 
 // shard returns the shard for key.
 func (c *s3fifo[K, V]) shard(key K) *shard[K, V] {
 	if c.keyIsInt {
 		//nolint:gosec // G115: intentional wrap for fast modulo
-		return c.shards[uint64(*(*int)(unsafe.Pointer(&key)))&c.shardMask]
+		return c.shards[c.shardIdx(uint64(*(*int)(unsafe.Pointer(&key))))]
 	}
 	if c.keyIsInt64 {
 		//nolint:gosec // G115: intentional wrap for fast modulo
-		return c.shards[uint64(*(*int64)(unsafe.Pointer(&key)))&c.shardMask]
+		return c.shards[c.shardIdx(uint64(*(*int64)(unsafe.Pointer(&key))))]
 	}
 	if c.keyIsString {
-		return c.shards[wyhashString(*(*string)(unsafe.Pointer(&key)))&c.shardMask]
+		return c.shards[c.shardIdx(wyhashString(*(*string)(unsafe.Pointer(&key))))]
 	}
 	switch k := any(key).(type) {
 	case uint:
-		return c.shards[uint64(k)&c.shardMask]
+		return c.shards[c.shardIdx(uint64(k))]
 	case uint64:
-		return c.shards[k&c.shardMask]
+		return c.shards[c.shardIdx(k)]
 	case string:
-		return c.shards[wyhashString(k)&c.shardMask]
+		return c.shards[c.shardIdx(wyhashString(k))]
 	case fmt.Stringer:
-		return c.shards[wyhashString(k.String())&c.shardMask]
+		return c.shards[c.shardIdx(wyhashString(k.String()))]
 	default:
-		return c.shards[wyhashString(fmt.Sprintf("%v", key))&c.shardMask]
+		return c.shards[c.shardIdx(wyhashString(fmt.Sprintf("%v", key)))]
 	}
 }
 
 // get retrieves a value, incrementing its frequency on hit.
 func (c *s3fifo[K, V]) get(key K) (V, bool) {
+	// Fast paths for common key types avoid interface overhead.
 	if c.keyIsString {
-		s := c.shards[wyhashString(*(*string)(unsafe.Pointer(&key)))&c.shardMask]
-		s.mu.RLock()
-		ent, ok := s.entries[key]
+		s := c.shards[c.shardIdx(wyhashString(*(*string)(unsafe.Pointer(&key))))]
+		ent, ok := s.entries.Load(key)
 		if !ok {
-			s.mu.RUnlock()
 			var zero V
 			return zero, false
 		}
-		val := ent.value
-		expiry := ent.expiryNano
-		s.mu.RUnlock()
-
-		if expiry != 0 && time.Now().UnixNano() > expiry {
+		if ent.onDeathRow {
+			return s.resurrectFromDeathRow(key)
+		}
+		if ent.expiryNano != 0 && time.Now().UnixNano() > ent.expiryNano {
 			var zero V
 			return zero, false
 		}
-
 		if ent.freq.Load() < maxFreq {
-			newFreq := ent.freq.Add(1)
-			if newFreq > ent.peakFreq.Load() {
+			if newFreq := ent.freq.Add(1); newFreq > ent.peakFreq.Load() {
 				ent.peakFreq.Store(newFreq)
 			}
 		}
-		return val, true
+		return ent.value, true
 	}
 	if c.keyIsInt {
 		//nolint:gosec // G115: intentional wrap for fast modulo
-		s := c.shards[uint64(*(*int)(unsafe.Pointer(&key)))&c.shardMask]
-		s.mu.RLock()
-		ent, ok := s.entries[key]
+		s := c.shards[c.shardIdx(uint64(*(*int)(unsafe.Pointer(&key))))]
+		ent, ok := s.entries.Load(key)
 		if !ok {
-			s.mu.RUnlock()
 			var zero V
 			return zero, false
 		}
-		val := ent.value
-		expiry := ent.expiryNano
-		s.mu.RUnlock()
-
-		if expiry != 0 && time.Now().UnixNano() > expiry {
+		if ent.onDeathRow {
+			return s.resurrectFromDeathRow(key)
+		}
+		if ent.expiryNano != 0 && time.Now().UnixNano() > ent.expiryNano {
 			var zero V
 			return zero, false
 		}
-
 		if ent.freq.Load() < maxFreq {
-			newFreq := ent.freq.Add(1)
-			if newFreq > ent.peakFreq.Load() {
+			if newFreq := ent.freq.Add(1); newFreq > ent.peakFreq.Load() {
 				ent.peakFreq.Store(newFreq)
 			}
 		}
-		return val, true
+		return ent.value, true
 	}
 	return c.shard(key).get(key)
 }
 
 func (s *shard[K, V]) get(key K) (V, bool) {
-	s.mu.RLock()
-	ent, ok := s.entries[key]
+	ent, ok := s.entries.Load(key)
 	if !ok {
-		s.mu.RUnlock()
 		var zero V
 		return zero, false
 	}
-
-	// If on death row, resurrect under write lock.
 	if ent.onDeathRow {
-		s.mu.RUnlock()
 		return s.resurrectFromDeathRow(key)
 	}
-
-	val := ent.value
-	expiry := ent.expiryNano
-	s.mu.RUnlock()
-
-	if expiry != 0 && time.Now().UnixNano() > expiry {
+	if ent.expiryNano != 0 && time.Now().UnixNano() > ent.expiryNano {
 		var zero V
 		return zero, false
 	}
-
 	if ent.freq.Load() < maxFreq {
-		newFreq := ent.freq.Add(1)
-		if newFreq > ent.peakFreq.Load() {
+		if newFreq := ent.freq.Add(1); newFreq > ent.peakFreq.Load() {
 			ent.peakFreq.Store(newFreq)
 		}
 	}
-	return val, true
+	return ent.value, true
 }
 
 // resurrectFromDeathRow brings an entry back from pending eviction.
 // Resurrected items go to main queue with freq=3 to protect them from immediate re-eviction.
 func (s *shard[K, V]) resurrectFromDeathRow(key K) (V, bool) {
 	s.mu.Lock()
-	ent, ok := s.entries[key]
+	ent, ok := s.entries.Load(key)
 	if !ok || !ent.onDeathRow {
 		s.mu.Unlock()
 		var zero V
@@ -440,10 +397,10 @@ func (s *shard[K, V]) resurrectFromDeathRow(key K) (V, bool) {
 	// Resurrect to main queue with boosted frequency.
 	ent.onDeathRow = false
 	ent.inSmall = false
-	ent.freq.Store(3) // boost freq for resurrection
+	ent.freq.Store(3)
 	ent.peakFreq.Store(3)
 	s.main.pushBack(ent)
-	s.parent.totalEntries.Add(1) // was decremented on death row entry
+	s.parent.totalEntries.Add(1)
 
 	val := ent.value
 	s.mu.Unlock()
@@ -454,12 +411,12 @@ func (s *shard[K, V]) resurrectFromDeathRow(key K) (V, bool) {
 func (c *s3fifo[K, V]) set(key K, value V, expiryNano int64) {
 	if c.keyIsString {
 		h := wyhashString(*(*string)(unsafe.Pointer(&key)))
-		c.shards[h&c.shardMask].setWithHash(key, value, expiryNano, h)
+		c.shards[c.shardIdx(h)].setWithHash(key, value, expiryNano, h)
 		return
 	}
 	if c.keyIsInt {
 		//nolint:gosec // G115: intentional wrap for fast modulo
-		c.shards[uint64(*(*int)(unsafe.Pointer(&key)))&c.shardMask].setWithHash(key, value, expiryNano, 0)
+		c.shards[c.shardIdx(uint64(*(*int)(unsafe.Pointer(&key))))].setWithHash(key, value, expiryNano, 0)
 		return
 	}
 	c.shard(key).setWithHash(key, value, expiryNano, 0)
@@ -469,12 +426,12 @@ func (c *s3fifo[K, V]) set(key K, value V, expiryNano int64) {
 func (s *shard[K, V]) setWithHash(key K, value V, expiryNano int64, hash uint64) {
 	s.mu.Lock()
 
-	if ent, ok := s.entries[key]; ok {
+	// Update existing entry if present.
+	if ent, exists := s.entries.Load(key); exists {
 		ent.value = value
 		ent.expiryNano = expiryNano
 		if ent.freq.Load() < maxFreq {
-			newFreq := ent.freq.Add(1)
-			if newFreq > ent.peakFreq.Load() {
+			if newFreq := ent.freq.Add(1); newFreq > ent.peakFreq.Load() {
 				ent.peakFreq.Store(newFreq)
 			}
 		}
@@ -482,14 +439,10 @@ func (s *shard[K, V]) setWithHash(key K, value V, expiryNano int64, hash uint64)
 		return
 	}
 
-	ent := s.allocEntry()
-	ent.key = key
-	ent.value = value
-	ent.expiryNano = expiryNano
+	// Create new entry.
+	ent := &entry[K, V]{key: key, value: value, expiryNano: expiryNano}
 
-	// Compute and cache hash for fast eviction.
-	// Avoids re-hashing string keys on eviction path.
-	// See experiment_results.md Phase 20, Exp B for details.
+	// Cache hash for fast eviction (avoids re-hashing string keys).
 	h := hash
 	if h == 0 {
 		h = s.hasher(key)
@@ -502,7 +455,7 @@ func (s *shard[K, V]) setWithHash(key K, value V, expiryNano int64, hash uint64)
 	if !s.warmupComplete && !full {
 		ent.inSmall = true
 		s.small.pushBack(ent)
-		s.entries[key] = ent
+		s.entries.Store(key, ent)
 		s.parent.totalEntries.Add(1)
 		s.mu.Unlock()
 		return
@@ -514,9 +467,7 @@ func (s *shard[K, V]) setWithHash(key K, value V, expiryNano int64, hash uint64)
 		inGhost := s.ghostActive.Contains(h) || s.ghostAging.Contains(h)
 		ent.inSmall = !inGhost
 
-		// Full ghost frequency restore: returning keys get 100% of their previous frequency.
-		// Improves: +0.37% zipf, +0.05% meta, +0.04% tencentPhoto, +0.03% wikipedia.
-		// See experiment_results.md Phase 19, Exp C for details.
+		// Restore frequency from ghost for returning keys.
 		if !ent.inSmall {
 			if peak, ok := s.ghostFreqRng.lookup(h); ok {
 				ent.freq.Store(peak)
@@ -539,7 +490,7 @@ func (s *shard[K, V]) setWithHash(key K, value V, expiryNano int64, hash uint64)
 		s.main.pushBack(ent)
 	}
 
-	s.entries[key] = ent
+	s.entries.Store(key, ent)
 	s.parent.totalEntries.Add(1)
 	s.mu.Unlock()
 }
@@ -552,7 +503,7 @@ func (s *shard[K, V]) delete(key K) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	ent, ok := s.entries[key]
+	ent, ok := s.entries.Load(key)
 	if !ok {
 		return
 	}
@@ -563,8 +514,7 @@ func (s *shard[K, V]) delete(key K) {
 		s.main.remove(ent)
 	}
 
-	delete(s.entries, key)
-	s.freeEntry(ent)
+	s.entries.Delete(key)
 	s.parent.totalEntries.Add(-1)
 }
 
@@ -646,34 +596,29 @@ func (s *shard[K, V]) evictFromMain() {
 func (s *shard[K, V]) sendToDeathRow(e *entry[K, V]) {
 	// If death row slot is occupied, truly evict that entry first.
 	if old := s.deathRow[s.deathRowPos]; old != nil {
-		delete(s.entries, old.key)
-		s.addToGhost(old.hash, old.peakFreq.Load()) // use cached hash
+		s.entries.Delete(old.key)
+		s.addToGhost(old.hash, old.peakFreq.Load())
 		old.onDeathRow = false
-		s.freeEntry(old)
 	}
 
-	// Put new entry on death row.
 	e.onDeathRow = true
 	s.deathRow[s.deathRowPos] = e
 	s.deathRowPos = (s.deathRowPos + 1) % len(s.deathRow)
-	s.parent.totalEntries.Add(-1) // count as evicted (will be restored on resurrection)
+	s.parent.totalEntries.Add(-1)
 }
 
 func (c *s3fifo[K, V]) len() int {
 	total := 0
-	for i := range c.shards {
-		s := c.shards[i]
-		s.mu.RLock()
-		total += len(s.entries)
-		s.mu.RUnlock()
+	for _, s := range c.shards {
+		total += s.entries.Size()
 	}
 	return total
 }
 
 func (c *s3fifo[K, V]) flush() int {
 	total := 0
-	for i := range c.shards {
-		total += c.shards[i].flush()
+	for _, s := range c.shards {
+		total += s.flush()
 	}
 	c.totalEntries.Store(0)
 	return total
@@ -683,12 +628,21 @@ func (s *shard[K, V]) flush() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	n := len(s.entries)
-	s.entries = make(map[K]*entry[K, V], s.capacity)
+	n := s.entries.Size()
+	s.entries.Clear()
 	s.small.head, s.small.tail, s.small.len = nil, nil, 0
 	s.main.head, s.main.tail, s.main.len = nil, nil, 0
 	s.ghostActive.Reset()
 	s.ghostAging.Reset()
-	s.ghostFreqRng = ghostFreqRing{} // zero value reset
+	s.ghostFreqRng = ghostFreqRing{}
+	for i := range s.deathRow {
+		s.deathRow[i] = nil
+	}
+	s.deathRowPos = 0
 	return n
+}
+
+// getEntry returns an entry for testing purposes (not for production use).
+func (s *shard[K, V]) getEntry(key K) (*entry[K, V], bool) {
+	return s.entries.Load(key)
 }

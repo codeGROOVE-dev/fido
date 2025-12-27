@@ -700,9 +700,7 @@ func TestS3FIFO_FrequencyCapAt7(t *testing.T) {
 
 	// Access the internal entry to check frequency
 	shard := cache.shard("hot")
-	shard.mu.RLock()
-	ent, ok := shard.entries["hot"]
-	shard.mu.RUnlock()
+	ent, ok := shard.getEntry("hot")
 
 	if !ok {
 		t.Fatal("entry not found")
@@ -727,10 +725,8 @@ func TestS3FIFO_SetIncrementsFrequency(t *testing.T) {
 
 	// Check initial frequency (should be 0 for new entries)
 	shard := cache.shard("key")
-	shard.mu.RLock()
-	ent := shard.entries["key"]
+	ent, _ := shard.getEntry("key")
 	initialFreq := ent.freq.Load()
-	shard.mu.RUnlock()
 
 	if initialFreq != 0 {
 		t.Errorf("initial frequency = %d; want 0", initialFreq)
@@ -742,10 +738,8 @@ func TestS3FIFO_SetIncrementsFrequency(t *testing.T) {
 	}
 
 	// Check that frequency increased due to updates
-	shard.mu.RLock()
-	ent = shard.entries["key"]
+	ent, _ = shard.getEntry("key")
 	finalFreq := ent.freq.Load()
-	shard.mu.RUnlock()
 
 	if finalFreq == 0 {
 		t.Error("frequency should have increased after updates, but is still 0")
@@ -896,13 +890,11 @@ func TestS3FIFO_GhostQueuePromotion(t *testing.T) {
 
 	// Check that key 0 is in main queue by inspecting internal state
 	shard := cache.shard(0)
-	shard.mu.RLock()
-	ent, ok := shard.entries[0]
+	ent, ok := shard.getEntry(0)
 	inSmall := false
 	if ok {
 		inSmall = ent.inSmall
 	}
-	shard.mu.RUnlock()
 
 	if !ok {
 		t.Fatal("key 0 not found after re-insertion")
