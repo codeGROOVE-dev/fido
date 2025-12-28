@@ -64,12 +64,12 @@ Where multicache wins:
 
 - **Throughput**: 1 billion ints/second at 16 threads or higher. (2-3X faster than otter)
 - **Hit rate**: Highest average across datasets (1.6% higher than sieve, 4.4% higher than otter)
-- **Latency**: 9-11ns Get, zero allocations (3-4X lower latency than otter)
+- **Latency**: 8-11ns Gets, zero allocations (3-4X lower latency than otter)
 
 Where others win:
 
 - **Memory**: freelru and otter use less memory per entry
-- **Some traces**: CLOCK/LRU marginally better on purely temporal workloads (IBM Docker, Thesios)
+- **Temporal workload hit rates**: Some caches work marginally better in certain workloads by a very thin margin: clock (+0.006% on thesios-block), sieve (+0.005% on thesios-file)
 
 Much of the credit for high throughput goes to [puzpuzpuz/xsync](https://github.com/puzpuzpuz/xsync). While highly sharded maps and flightGroups performed well, you can't beat xsync's lock-free data structures.
 
