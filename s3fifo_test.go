@@ -1200,7 +1200,8 @@ func TestS3FIFO_CapacityBound_PathologicalDemotion(t *testing.T) {
 // This triggers the promotion path in evictFromSmall.
 func TestS3FIFO_CapacityBound_AllHotEntries(t *testing.T) {
 	capacity := 5000
-	maxOvershoot := runtime.GOMAXPROCS(0) * 4
+	// Max overshoot = 1% of capacity (hard cap in s3fifo.go).
+	maxOvershoot := capacity / 100
 	maxAllowed := capacity + maxOvershoot
 
 	cache := newS3FIFO[int, int](&config{size: capacity})
@@ -1372,4 +1373,1160 @@ func TestS3FIFO_MemoryLeak_LargeValues(t *testing.T) {
 		baseline.HeapAlloc/(1024*1024),
 		afterChurn.HeapAlloc/(1024*1024),
 		cache.len())
+}
+
+// TestS3FIFO_BloomFilter_SmallCapacity tests bloom filter with capacity < 1.
+func TestS3FIFO_BloomFilter_SmallCapacity(t *testing.T) {
+	// newBloomFilter should handle capacity < 1 gracefully
+	bf := newBloomFilter(0, 0.01)
+	if bf == nil {
+		t.Fatal("newBloomFilter returned nil for capacity=0")
+	}
+
+	// Should still work
+	bf.Add(12345)
+	if !bf.Contains(12345) {
+		t.Error("bloom filter should contain added hash")
+	}
+
+	// Test with negative capacity
+	bf2 := newBloomFilter(-5, 0.01)
+	if bf2 == nil {
+		t.Fatal("newBloomFilter returned nil for negative capacity")
+	}
+	bf2.Add(67890)
+	if !bf2.Contains(67890) {
+		t.Error("bloom filter should contain added hash")
+	}
+}
+
+// TestS3FIFO_DeathRowResurrection tests the resurrection path from death row.
+func TestS3FIFO_DeathRowResurrection(t *testing.T) {
+	// Small cache to trigger death row quickly
+	cache := newS3FIFO[int, int](&config{size: 100})
+
+	// Fill cache completely
+	for i := range 100 {
+		cache.set(i, i*10, 0)
+	}
+
+	// Access some items to make them hot (high peakFreq for death row admission)
+	for range 5 {
+		for i := range 20 {
+			cache.get(i)
+		}
+	}
+
+	// Add many more items to force evictions to death row
+	for i := 100; i < 300; i++ {
+		cache.set(i, i*10, 0)
+	}
+
+	// Now check if any hot items are on death row by accessing them
+	resurrectedCount := 0
+	for i := range 20 {
+		if val, ok := cache.get(i); ok {
+			if val == i*10 {
+				resurrectedCount++
+			}
+		}
+	}
+
+	t.Logf("Resurrected %d items from death row", resurrectedCount)
+}
+
+// TestS3FIFO_DeathRowResurrectionTriggersEviction tests resurrection when cache is full.
+func TestS3FIFO_DeathRowResurrectionTriggersEviction(t *testing.T) {
+	// Small cache
+	cache := newS3FIFO[int, int](&config{size: 50})
+
+	// Fill cache
+	for i := range 50 {
+		cache.set(i, i*10, 0)
+	}
+
+	// Access items to make them hot
+	for range 5 {
+		for i := range 10 {
+			cache.get(i)
+		}
+	}
+
+	// Add more to force evictions (hot items may go to death row)
+	for i := 50; i < 150; i++ {
+		cache.set(i, i*10, 0)
+	}
+
+	// Now fill again to max capacity
+	for i := 150; i < 200; i++ {
+		cache.set(i, i*10, 0)
+	}
+
+	// Try to resurrect items - this should trigger eviction since cache is full
+	for i := range 10 {
+		cache.get(i)
+	}
+
+	// Cache should still be at capacity
+	if cache.len() > 55 { // Allow small overshoot
+		t.Errorf("cache len = %d; should be near 50", cache.len())
+	}
+}
+
+// TestS3FIFO_DeleteFromMainQueue tests deleting an item that's in the main queue.
+func TestS3FIFO_DeleteFromMainQueue(t *testing.T) {
+	// Use larger cache to ensure items survive eviction
+	cache := newS3FIFO[int, int](&config{size: 1000})
+
+	// Fill cache partially
+	for i := range 500 {
+		cache.set(i, i*10, 0)
+	}
+
+	// Access items multiple times to promote them to main queue
+	for range 5 {
+		for i := range 100 {
+			cache.get(i)
+		}
+	}
+
+	// Add more items to trigger eviction from small, promoting accessed items to main
+	for i := 500; i < 800; i++ {
+		cache.set(i, i*10, 0)
+	}
+
+	// Verify an item is in cache before delete
+	if _, ok := cache.get(0); !ok {
+		t.Skip("key 0 was evicted, skipping main queue delete test")
+	}
+
+	// Now delete an item that should be in main queue
+	cache.del(0)
+
+	// Verify it's deleted
+	if _, ok := cache.get(0); ok {
+		t.Error("key 0 should be deleted")
+	}
+
+	// Check that cache still works
+	cache.set(9999, 9999, 0)
+	if val, ok := cache.get(9999); !ok || val != 9999 {
+		t.Errorf("get(9999) = %d, %v; want 9999, true", val, ok)
+	}
+}
+
+// TestS3FIFO_GhostQueueRotation tests ghost queue rotation when it fills up.
+func TestS3FIFO_GhostQueueRotation(t *testing.T) {
+	// Small cache with small ghost capacity
+	cache := newS3FIFO[int, int](&config{size: 100})
+
+	// Ghost capacity is 8x cache size = 800
+	// Fill cache
+	for i := range 100 {
+		cache.set(i, i*10, 0)
+	}
+
+	// Insert many unique keys to trigger many evictions and fill ghost queue
+	// Need > 800 evictions to trigger ghost rotation
+	for i := 100; i < 2000; i++ {
+		cache.set(i, i*10, 0)
+	}
+
+	// Now re-insert some keys that should have been evicted (and be in ghost)
+	// They should go to main queue if still in ghost
+	for i := range 50 {
+		cache.set(i, i*100, 0) // Different value to verify it's updated
+	}
+
+	// Verify the re-inserted keys have the new value
+	for i := range 50 {
+		if val, ok := cache.get(i); ok {
+			if val != i*100 {
+				t.Errorf("key %d = %d; want %d", i, val, i*100)
+			}
+		}
+	}
+}
+
+// TestS3FIFO_GhostFrequencyRestoration tests that frequency is restored from ghost.
+func TestS3FIFO_GhostFrequencyRestoration(t *testing.T) {
+	cache := newS3FIFO[int, int](&config{size: 100})
+
+	// Fill cache
+	for i := range 100 {
+		cache.set(i, i*10, 0)
+	}
+
+	// Access key 0 many times to give it high peakFreq
+	for range 10 {
+		cache.get(0)
+	}
+
+	// Evict key 0 by adding many new keys
+	for i := 100; i < 300; i++ {
+		cache.set(i, i*10, 0)
+	}
+
+	// Key 0 should be evicted now
+	if _, ok := cache.get(0); ok {
+		// If still in cache (or resurrected), skip this test
+		t.Log("key 0 still in cache (may have been resurrected)")
+		return
+	}
+
+	// Re-insert key 0 - it should restore frequency from ghost
+	cache.set(0, 999, 0)
+
+	// Get the entry and check if it's in main (not small)
+	ent, ok := cache.getEntry(0)
+	if !ok {
+		t.Fatal("key 0 not found after re-insert")
+	}
+
+	// Entry should be in main queue if ghost had it
+	if ent.inSmall {
+		t.Log("key 0 in small queue (ghost may have rotated)")
+	} else {
+		t.Log("key 0 in main queue (restored from ghost)")
+	}
+}
+
+// TestS3FIFO_HashString_EmptyString tests hashing empty string.
+func TestS3FIFO_HashString_EmptyString(t *testing.T) {
+	cache := newS3FIFO[string, int](&config{size: 100})
+
+	// Empty string should work
+	cache.set("", 42, 0)
+	if val, ok := cache.get(""); !ok || val != 42 {
+		t.Errorf("empty string: got %d, %v; want 42, true", val, ok)
+	}
+}
+
+// TestS3FIFO_HashString_ShortStrings tests hashing strings of various lengths.
+func TestS3FIFO_HashString_ShortStrings(t *testing.T) {
+	cache := newS3FIFO[string, int](&config{size: 100})
+
+	// Test strings of length 1-8 (different code paths in hashString)
+	testCases := []string{
+		"a",         // len 1
+		"ab",        // len 2
+		"abc",       // len 3
+		"abcd",      // len 4 (uses uint32 path)
+		"abcde",     // len 5
+		"abcdef",    // len 6
+		"abcdefg",   // len 7
+		"abcdefgh",  // len 8 (uses uint64 path)
+		"abcdefghi", // len 9 (uses uint64 path)
+	}
+
+	for i, s := range testCases {
+		cache.set(s, i+1, 0)
+	}
+
+	for i, s := range testCases {
+		if val, ok := cache.get(s); !ok || val != i+1 {
+			t.Errorf("string %q (len %d): got %d, %v; want %d, true", s, len(s), val, ok, i+1)
+		}
+	}
+}
+
+// TestS3FIFO_TimeToNano tests the timeToNano helper.
+func TestS3FIFO_TimeToNano(t *testing.T) {
+	// Zero time should return 0
+	if got := timeToNano(time.Time{}); got != 0 {
+		t.Errorf("timeToNano(zero) = %d; want 0", got)
+	}
+
+	// Non-zero time should return UnixNano
+	now := time.Now()
+	if got := timeToNano(now); got != now.UnixNano() {
+		t.Errorf("timeToNano(now) = %d; want %d", got, now.UnixNano())
+	}
+}
+
+// TestS3FIFO_ResurrectNotOnDeathRow tests resurrection when entry is no longer on death row.
+func TestS3FIFO_ResurrectNotOnDeathRow(t *testing.T) {
+	cache := newS3FIFO[int, int](&config{size: 50})
+
+	// Fill cache
+	for i := range 50 {
+		cache.set(i, i*10, 0)
+	}
+
+	// Access items to make them hot
+	for range 5 {
+		for i := range 10 {
+			cache.get(i)
+		}
+	}
+
+	// Add items to push hot items to death row
+	for i := 50; i < 100; i++ {
+		cache.set(i, i*10, 0)
+	}
+
+	// Add many more items to cycle through death row completely
+	// Death row is small, so this should evict death row items
+	for i := 100; i < 500; i++ {
+		cache.set(i, i*10, 0)
+	}
+
+	// Try to access an item that was once hot but is now gone
+	// This tests the path where entry exists but is not on death row
+	for i := range 10 {
+		cache.get(i) // May or may not find it
+	}
+}
+
+// TestS3FIFO_EvictFromSmall_EmptyQueue tests eviction when small queue is empty.
+func TestS3FIFO_EvictFromSmall_EmptyQueue(t *testing.T) {
+	cache := newS3FIFO[int, int](&config{size: 100})
+
+	// Fill cache
+	for i := range 100 {
+		cache.set(i, i*10, 0)
+	}
+
+	// Access all items many times to promote them all to main
+	for range 5 {
+		for i := range 100 {
+			cache.get(i)
+		}
+	}
+
+	// Add more items to trigger eviction
+	// With all items promoted to main, small queue should be empty after some ops
+	for i := 100; i < 200; i++ {
+		cache.set(i, i*10, 0)
+	}
+
+	// Cache should still work
+	cache.set(999, 999, 0)
+	if val, ok := cache.get(999); !ok || val != 999 {
+		t.Errorf("get(999) = %d, %v; want 999, true", val, ok)
+	}
+}
+
+// TestS3FIFO_EvictFromMain_AllCold tests eviction when all main entries are cold.
+func TestS3FIFO_EvictFromMain_AllCold(t *testing.T) {
+	cache := newS3FIFO[int, int](&config{size: 100})
+
+	// Fill cache
+	for i := range 100 {
+		cache.set(i, i*10, 0)
+	}
+
+	// Access items once to get them to main (but freq will decay)
+	for i := range 100 {
+		cache.get(i)
+		cache.get(i)
+	}
+
+	// Add many more items without accessing existing ones
+	// This should evict from main when items become cold
+	for i := 100; i < 500; i++ {
+		cache.set(i, i*10, 0)
+	}
+
+	// Cache should be at capacity
+	if cache.len() > 110 {
+		t.Errorf("cache len = %d; should be near 100", cache.len())
+	}
+}
+
+// TestS3FIFO_GhostFreqRing tests the ghost frequency ring buffer.
+func TestS3FIFO_GhostFreqRing(t *testing.T) {
+	var ring ghostFreqRing
+
+	// Add some entries
+	ring.add(100, 5)
+	ring.add(200, 10)
+	ring.add(300, 15)
+
+	// Lookup existing
+	if freq, ok := ring.lookup(100); !ok || freq != 5 {
+		t.Errorf("lookup(100) = %d, %v; want 5, true", freq, ok)
+	}
+	if freq, ok := ring.lookup(200); !ok || freq != 10 {
+		t.Errorf("lookup(200) = %d, %v; want 10, true", freq, ok)
+	}
+
+	// Lookup non-existing
+	if _, ok := ring.lookup(999); ok {
+		t.Error("lookup(999) should return false")
+	}
+
+	// Fill ring to wrap around
+	for i := range 300 {
+		ring.add(uint64(1000+i), uint32(i))
+	}
+
+	// Old entries should be overwritten
+	if _, ok := ring.lookup(100); ok {
+		t.Error("lookup(100) should return false after wrap")
+	}
+}
+
+// TestS3FIFO_DeleteFromSmallQueue tests deleting an item that's in the small queue.
+func TestS3FIFO_DeleteFromSmallQueue(t *testing.T) {
+	cache := newS3FIFO[int, int](&config{size: 100})
+
+	// Fill cache partially (items stay in small queue initially)
+	for i := range 50 {
+		cache.set(i, i*10, 0)
+	}
+
+	// Delete an item from small queue
+	cache.del(25)
+
+	// Verify it's deleted
+	if _, ok := cache.get(25); ok {
+		t.Error("key 25 should be deleted")
+	}
+
+	// Other items should still work
+	if val, ok := cache.get(0); !ok || val != 0 {
+		t.Errorf("get(0) = %d, %v; want 0, true", val, ok)
+	}
+}
+
+// TestS3FIFO_DeleteNonexistent tests deleting a key that doesn't exist.
+func TestS3FIFO_DeleteNonexistent(t *testing.T) {
+	cache := newS3FIFO[int, int](&config{size: 100})
+
+	// Delete nonexistent key should not panic
+	cache.del(999)
+
+	// Cache should still work
+	cache.set(1, 10, 0)
+	if val, ok := cache.get(1); !ok || val != 10 {
+		t.Errorf("get(1) = %d, %v; want 10, true", val, ok)
+	}
+}
+
+// TestS3FIFO_ResurrectFullCache tests resurrection when cache is completely full.
+func TestS3FIFO_ResurrectFullCache(t *testing.T) {
+	cache := newS3FIFO[int, int](&config{size: 100})
+
+	// Fill cache
+	for i := range 100 {
+		cache.set(i, i*10, 0)
+	}
+
+	// Access first 20 items many times (make them hot)
+	for range 10 {
+		for i := range 20 {
+			cache.get(i)
+		}
+	}
+
+	// Fill to capacity again with new items (evicts old ones)
+	for i := 100; i < 200; i++ {
+		cache.set(i, i*10, 0)
+	}
+
+	// Continue until cache is at capacity
+	for i := 200; i < 250; i++ {
+		cache.set(i, i*10, 0)
+	}
+
+	// Now try to resurrect an item when cache is full
+	// This should trigger eviction after resurrection
+	for i := range 20 {
+		cache.get(i)
+	}
+
+	// Cache should be at or near capacity
+	if cache.len() > 110 {
+		t.Errorf("cache len = %d; should be near 100", cache.len())
+	}
+}
+
+// TestS3FIFO_EvictFromMainWithDemotion tests the demotion path in evictFromMain.
+func TestS3FIFO_EvictFromMainWithDemotion(t *testing.T) {
+	cache := newS3FIFO[int, int](&config{size: 100})
+
+	// Fill cache
+	for i := range 100 {
+		cache.set(i, i*10, 0)
+	}
+
+	// Access first 50 items once (gives peakFreq >= 1)
+	for i := range 50 {
+		cache.get(i)
+	}
+
+	// Access them once more to get them promoted to main
+	for i := range 50 {
+		cache.get(i)
+	}
+
+	// Add more items to trigger eviction from main
+	// Items with peakFreq >= 1 should be demoted, not evicted
+	for i := 100; i < 300; i++ {
+		cache.set(i, i*10, 0)
+	}
+
+	// Cache should be at capacity
+	if cache.len() > 110 {
+		t.Errorf("cache len = %d; should be near 100", cache.len())
+	}
+}
+
+// TestS3FIFO_EvictFromMainWithSecondChance tests the second chance mechanism.
+func TestS3FIFO_EvictFromMainWithSecondChance(t *testing.T) {
+	cache := newS3FIFO[int, int](&config{size: 100})
+
+	// Fill cache
+	for i := range 100 {
+		cache.set(i, i*10, 0)
+	}
+
+	// Access all items multiple times to give them high frequency
+	for range 5 {
+		for i := range 100 {
+			cache.get(i)
+		}
+	}
+
+	// Add more items - items with freq > 0 get second chance
+	for i := 100; i < 200; i++ {
+		cache.set(i, i*10, 0)
+	}
+
+	// Continue adding to force eviction
+	for i := 200; i < 300; i++ {
+		cache.set(i, i*10, 0)
+	}
+
+	// Hot items should have survived longer due to second chance
+	survivedCount := 0
+	for i := range 50 {
+		if _, ok := cache.get(i); ok {
+			survivedCount++
+		}
+	}
+
+	t.Logf("Survived: %d/50 hot items", survivedCount)
+}
+
+// TestS3FIFO_EvictFromSmallPromotion tests promotion from small to main during eviction.
+func TestS3FIFO_EvictFromSmallPromotion(t *testing.T) {
+	cache := newS3FIFO[int, int](&config{size: 100})
+
+	// Fill cache
+	for i := range 100 {
+		cache.set(i, i*10, 0)
+	}
+
+	// Access items enough times to trigger promotion (freq >= 2)
+	for i := range 50 {
+		cache.get(i)
+		cache.get(i)
+	}
+
+	// Add more items to trigger eviction from small
+	// Items with freq >= 2 should be promoted to main
+	for i := 100; i < 150; i++ {
+		cache.set(i, i*10, 0)
+	}
+
+	// Check that accessed items survived (were promoted)
+	survivedCount := 0
+	for i := range 50 {
+		if _, ok := cache.get(i); ok {
+			survivedCount++
+		}
+	}
+
+	if survivedCount < 30 {
+		t.Errorf("only %d/50 accessed items survived; expected more due to promotion", survivedCount)
+	}
+}
+
+// TestS3FIFO_SetWithHash_NonZeroHash tests setWithHash with pre-computed hash.
+func TestS3FIFO_SetWithHash_NonZeroHash(t *testing.T) {
+	cache := newS3FIFO[string, int](&config{size: 100})
+
+	// Set with pre-computed hash
+	key := "testkey"
+	hash := hashString(key)
+	cache.setWithHash(key, 42, 0, hash)
+
+	// Should be retrievable
+	if val, ok := cache.get(key); !ok || val != 42 {
+		t.Errorf("get(%q) = %d, %v; want 42, true", key, val, ok)
+	}
+}
+
+// TestS3FIFO_SetWithHash_ZeroHash tests setWithHash with hash=0 (should compute).
+func TestS3FIFO_SetWithHash_ZeroHash(t *testing.T) {
+	cache := newS3FIFO[int, int](&config{size: 100})
+
+	// Set with zero hash (should compute internally)
+	cache.setWithHash(42, 100, 0, 0)
+
+	// Should be retrievable
+	if val, ok := cache.get(42); !ok || val != 100 {
+		t.Errorf("get(42) = %d, %v; want 100, true", val, ok)
+	}
+}
+
+// TestS3FIFO_UpdateExistingInLockPath tests updating existing entry after lock acquisition.
+func TestS3FIFO_UpdateExistingInLockPath(t *testing.T) {
+	cache := newS3FIFO[int, int](&config{size: 100})
+
+	// Pre-populate
+	cache.set(1, 10, 0)
+
+	// Concurrent updates should handle the lock path correctly
+	var wg sync.WaitGroup
+	for i := range 10 {
+		wg.Add(1)
+		go func(val int) {
+			defer wg.Done()
+			cache.set(1, val*100, 0)
+		}(i)
+	}
+	wg.Wait()
+
+	// Final value should be one of the updates
+	if val, ok := cache.get(1); !ok {
+		t.Error("key 1 should exist")
+	} else if val < 0 || val > 900 {
+		t.Errorf("get(1) = %d; unexpected value", val)
+	}
+}
+
+// TestS3FIFO_WarmupPhase tests behavior during warmup (before full).
+func TestS3FIFO_WarmupPhase(t *testing.T) {
+	cache := newS3FIFO[int, int](&config{size: 100})
+
+	// During warmup, items go directly to small queue
+	for i := range 50 {
+		cache.set(i, i*10, 0)
+	}
+
+	// All items should be present
+	for i := range 50 {
+		if val, ok := cache.get(i); !ok || val != i*10 {
+			t.Errorf("get(%d) = %d, %v; want %d, true", i, val, ok, i*10)
+		}
+	}
+}
+
+// TestS3FIFO_ResurrectEntry_NotOnDeathRow tests resurrection path when entry exists but not on death row.
+func TestS3FIFO_ResurrectEntry_NotOnDeathRow(t *testing.T) {
+	cache := newS3FIFO[int, int](&config{size: 50})
+
+	// Fill cache
+	for i := range 50 {
+		cache.set(i, i*10, 0)
+	}
+
+	// Access some items to make them hot
+	for range 5 {
+		for i := range 10 {
+			cache.get(i)
+		}
+	}
+
+	// Evict hot items to death row
+	for i := 50; i < 100; i++ {
+		cache.set(i, i*10, 0)
+	}
+
+	// Access many more items to cycle through death row completely
+	for i := 100; i < 300; i++ {
+		cache.set(i, i*10, 0)
+	}
+
+	// Accessing an evicted item now should return not found
+	// because it was pushed off death row
+	for i := range 10 {
+		if _, ok := cache.get(i); ok {
+			// Item still exists (either still on death row or resurrected)
+			t.Logf("key %d still accessible (may have been resurrected)", i)
+		}
+	}
+}
+
+// TestS3FIFO_HashInt64 tests the hashInt64 function.
+func TestS3FIFO_HashInt64(t *testing.T) {
+	// Verify hash produces reasonable distribution
+	hashes := make(map[uint64]bool)
+	for i := range 1000 {
+		h := hashInt64(int64(i))
+		if hashes[h] {
+			t.Errorf("collision at i=%d", i)
+		}
+		hashes[h] = true
+	}
+
+	// Test negative values
+	h1 := hashInt64(-1)
+	h2 := hashInt64(-2)
+	if h1 == h2 {
+		t.Error("different inputs should produce different hashes")
+	}
+}
+
+// TestS3FIFO_EvictFromMainEmpty tests evictFromMain when main is empty.
+func TestS3FIFO_EvictFromMainEmpty(t *testing.T) {
+	cache := newS3FIFO[int, int](&config{size: 100})
+
+	// Fill only small queue
+	for i := range 20 {
+		cache.set(i, i*10, 0)
+	}
+
+	// Small queue should have items, main should be empty
+	// evictFromMain should return false and do nothing
+	result := cache.evictFromMain()
+	if result {
+		t.Error("evictFromMain should return false when main is empty")
+	}
+}
+
+// TestS3FIFO_DefaultHasher_Uint tests the default hasher with uint keys.
+func TestS3FIFO_DefaultHasher_Uint(t *testing.T) {
+	cache := newS3FIFO[uint, int](&config{size: 100})
+
+	// Test basic operations with uint keys
+	cache.set(uint(42), 420, 0)
+	cache.set(uint(0), 0, 0)
+	cache.set(uint(100), 1000, 0)
+
+	if val, ok := cache.get(uint(42)); !ok || val != 420 {
+		t.Errorf("get(42) = %d, %v; want 420, true", val, ok)
+	}
+	if val, ok := cache.get(uint(0)); !ok || val != 0 {
+		t.Errorf("get(0) = %d, %v; want 0, true", val, ok)
+	}
+	if val, ok := cache.get(uint(100)); !ok || val != 1000 {
+		t.Errorf("get(100) = %d, %v; want 1000, true", val, ok)
+	}
+}
+
+// TestS3FIFO_DefaultHasher_Uint64 tests the default hasher with uint64 keys.
+func TestS3FIFO_DefaultHasher_Uint64(t *testing.T) {
+	cache := newS3FIFO[uint64, int](&config{size: 100})
+
+	cache.set(uint64(1<<63), 1, 0)
+	cache.set(uint64(0), 2, 0)
+	cache.set(uint64(12345), 3, 0)
+
+	if val, ok := cache.get(uint64(1 << 63)); !ok || val != 1 {
+		t.Errorf("get(1<<63) = %d, %v; want 1, true", val, ok)
+	}
+	if val, ok := cache.get(uint64(0)); !ok || val != 2 {
+		t.Errorf("get(0) = %d, %v; want 2, true", val, ok)
+	}
+}
+
+// TestS3FIFO_EvictFromSmall_PromotionTriggersMainEviction tests the cascade path.
+func TestS3FIFO_EvictFromSmall_PromotionTriggersMainEviction(t *testing.T) {
+	// Use small cache where main queue capacity (10%) is easily exceeded
+	cache := newS3FIFO[int, int](&config{size: 100})
+
+	// Fill cache
+	for i := range 100 {
+		cache.set(i, i*10, 0)
+	}
+
+	// Access all items multiple times to give them high freq
+	for range 3 {
+		for i := range 100 {
+			cache.get(i)
+		}
+	}
+
+	// Now small items have high freq, so when evicted they promote to main
+	// Main will overflow (>90% capacity) and trigger eviction
+
+	// Add more items to trigger this cascade
+	for i := 100; i < 200; i++ {
+		cache.set(i, i*10, 0)
+	}
+
+	// Cache should remain at capacity
+	if cache.len() > 110 {
+		t.Errorf("cache len = %d; should be near 100", cache.len())
+	}
+}
+
+// TestS3FIFO_DeleteItemInMain tests deleting an item that's specifically in the main queue.
+func TestS3FIFO_DeleteItemInMain(t *testing.T) {
+	cache := newS3FIFO[int, int](&config{size: 100})
+
+	// Fill cache to capacity
+	for i := range 100 {
+		cache.set(i, i*10, 0)
+	}
+
+	// Access first 50 items many times to ensure freq >= 2 for promotion
+	for range 5 {
+		for i := range 50 {
+			cache.get(i)
+		}
+	}
+
+	// Add more items to trigger eviction from small queue
+	// Items with freq >= 2 will be promoted to main queue
+	for i := 100; i < 200; i++ {
+		cache.set(i, i*10, 0)
+	}
+
+	// Find an entry in main queue (not inSmall, not onDeathRow)
+	for i := range 50 {
+		if ent, ok := cache.getEntry(i); ok && !ent.inSmall && !ent.onDeathRow {
+			// Found one in main - delete it
+			t.Logf("Found key %d in main queue, deleting", i)
+			cache.del(i)
+			if _, ok := cache.get(i); ok {
+				t.Errorf("key %d should be deleted", i)
+			}
+			return
+		}
+	}
+
+	// If we reach here, let's debug
+	var inSmallCount, inMainCount, onDeathRowCount int
+	for i := range 50 {
+		if ent, ok := cache.getEntry(i); ok {
+			if ent.onDeathRow {
+				onDeathRowCount++
+			} else if ent.inSmall {
+				inSmallCount++
+			} else {
+				inMainCount++
+			}
+		}
+	}
+	t.Logf("Stats: inSmall=%d, inMain=%d, onDeathRow=%d", inSmallCount, inMainCount, onDeathRowCount)
+	t.Log("Could not find item in main queue for deletion test")
+}
+
+// TestS3FIFO_ResurrectFromDeathRow_Detailed tests resurrection with eviction.
+func TestS3FIFO_ResurrectFromDeathRow_Detailed(t *testing.T) {
+	cache := newS3FIFO[int, int](&config{size: 50})
+
+	// Fill cache
+	for i := range 50 {
+		cache.set(i, i*10, 0)
+	}
+
+	// Access first 10 items many times to make them very hot
+	for range 10 {
+		for i := range 10 {
+			cache.get(i)
+		}
+	}
+
+	// Evict hot items to death row by adding new items
+	for i := 50; i < 100; i++ {
+		cache.set(i, i*10, 0)
+	}
+
+	// Find items on death row and try to resurrect them
+	for i := range 10 {
+		if ent, ok := cache.getEntry(i); ok && ent.onDeathRow {
+			// Found one on death row - access it to resurrect
+			val, found := cache.get(i)
+			if found {
+				t.Logf("Resurrected key %d with value %d", i, val)
+			}
+		}
+	}
+}
+
+// TestS3FIFO_SampleAvgPeakFreq_Empty tests sampleAvgPeakFreq with empty main.
+func TestS3FIFO_SampleAvgPeakFreq_Empty(t *testing.T) {
+	cache := newS3FIFO[int, int](&config{size: 100})
+
+	// Main queue is empty
+	avg := cache.sampleAvgPeakFreq()
+	if avg != 1 {
+		t.Errorf("sampleAvgPeakFreq() = %d; want 1 (minimum)", avg)
+	}
+}
+
+// TestS3FIFO_EntryListOperations tests the entry list operations directly.
+func TestS3FIFO_EntryListOperations(t *testing.T) {
+	var list entryList[int, int]
+
+	e1 := &entry[int, int]{key: 1}
+	e2 := &entry[int, int]{key: 2}
+	e3 := &entry[int, int]{key: 3}
+
+	// Push entries
+	list.pushBack(e1)
+	if list.len != 1 || list.head != e1 || list.tail != e1 {
+		t.Error("pushBack first element failed")
+	}
+
+	list.pushBack(e2)
+	list.pushBack(e3)
+	if list.len != 3 || list.head != e1 || list.tail != e3 {
+		t.Error("pushBack multiple elements failed")
+	}
+
+	// Remove middle
+	list.remove(e2)
+	if list.len != 2 || e1.next != e3 || e3.prev != e1 {
+		t.Error("remove middle element failed")
+	}
+
+	// Remove head
+	list.remove(e1)
+	if list.len != 1 || list.head != e3 || list.tail != e3 {
+		t.Error("remove head element failed")
+	}
+
+	// Remove last
+	list.remove(e3)
+	if list.len != 0 || list.head != nil || list.tail != nil {
+		t.Error("remove last element failed")
+	}
+}
+
+// structKey is used to test the default hasher fallback (not uint, uint64, string, or fmt.Stringer).
+type structKey struct {
+	A int
+	B int
+}
+
+// TestS3FIFO_DefaultHasher_StructKey tests the default hasher fallback with struct keys.
+func TestS3FIFO_DefaultHasher_StructKey(t *testing.T) {
+	cache := newS3FIFO[structKey, int](&config{size: 100})
+
+	key1 := structKey{A: 1, B: 2}
+	key2 := structKey{A: 3, B: 4}
+
+	cache.set(key1, 100, 0)
+	cache.set(key2, 200, 0)
+
+	if val, ok := cache.get(key1); !ok || val != 100 {
+		t.Errorf("get(key1) = %v, %v; want 100, true", val, ok)
+	}
+	if val, ok := cache.get(key2); !ok || val != 200 {
+		t.Errorf("get(key2) = %v, %v; want 200, true", val, ok)
+	}
+
+	// Test update
+	cache.set(key1, 150, 0)
+	if val, ok := cache.get(key1); !ok || val != 150 {
+		t.Errorf("get(key1) after update = %v, %v; want 150, true", val, ok)
+	}
+
+	// Test delete
+	cache.del(key1)
+	if _, ok := cache.get(key1); ok {
+		t.Error("key1 should be deleted")
+	}
+}
+
+// TestS3FIFO_ResurrectFromDeathRow_WithEviction tests resurrection that triggers eviction.
+func TestS3FIFO_ResurrectFromDeathRow_WithEviction(t *testing.T) {
+	// Small cache to make it easier to fill and trigger eviction
+	cache := newS3FIFO[int, int](&config{size: 20})
+
+	// Fill cache with initial items
+	for i := range 20 {
+		cache.set(i, i*10, 0)
+	}
+
+	// Access some items to increase frequency and get them promoted to main
+	for range 5 {
+		for i := range 10 {
+			cache.get(i)
+		}
+	}
+
+	// Add more items to cause eviction, pushing some items to death row
+	for i := 20; i < 40; i++ {
+		cache.set(i, i*10, 0)
+	}
+
+	// Find an item on death row
+	var foundOnDeathRow int = -1
+	for i := range 20 {
+		if ent, ok := cache.getEntry(i); ok && ent.onDeathRow {
+			foundOnDeathRow = i
+			break
+		}
+	}
+
+	if foundOnDeathRow == -1 {
+		t.Skip("No items found on death row for this test")
+	}
+
+	// Access the death row item to resurrect it - this may trigger eviction
+	// since we're at capacity and resurrection adds back to main
+	val, ok := cache.get(foundOnDeathRow)
+	if !ok {
+		t.Errorf("Failed to resurrect item %d", foundOnDeathRow)
+	} else {
+		t.Logf("Resurrected key %d with value %d", foundOnDeathRow, val)
+	}
+
+	// Verify the item is no longer on death row
+	if ent, ok := cache.getEntry(foundOnDeathRow); ok {
+		if ent.onDeathRow {
+			t.Error("Item should not be on death row after resurrection")
+		}
+		if ent.inSmall {
+			t.Error("Resurrected item should be in main queue, not small")
+		}
+	}
+}
+
+// TestS3FIFO_ResurrectFromDeathRow_NotOnDeathRow tests the early return when entry exists but not on death row.
+func TestS3FIFO_ResurrectFromDeathRow_NotOnDeathRow(t *testing.T) {
+	cache := newS3FIFO[int, int](&config{size: 100})
+
+	// Add an item normally
+	cache.set(1, 100, 0)
+
+	// Try to call resurrectFromDeathRow directly - it should return early
+	// since the item is not on death row
+	val, ok := cache.resurrectFromDeathRow(1)
+
+	// Since the entry exists but is not on death row, we should get ok=true with the value
+	if !ok {
+		t.Errorf("resurrectFromDeathRow returned ok=false for existing entry not on death row")
+	}
+	// The value might be returned since ok is based on entry existence
+	_ = val
+
+	// The entry should still be in the cache
+	if v, found := cache.get(1); !found || v != 100 {
+		t.Errorf("get(1) = %v, %v; want 100, true", v, found)
+	}
+}
+
+// TestS3FIFO_ResurrectFromDeathRow_NotFound tests the early return when entry doesn't exist.
+func TestS3FIFO_ResurrectFromDeathRow_NotFound(t *testing.T) {
+	cache := newS3FIFO[int, int](&config{size: 100})
+
+	// Try to resurrect a key that was never added
+	val, ok := cache.resurrectFromDeathRow(999)
+
+	if ok {
+		t.Errorf("resurrectFromDeathRow returned ok=true for non-existent key, val=%v", val)
+	}
+}
+
+// TestS3FIFO_EvictFromSmall_ReturnsFalse tests evictFromSmall returning false.
+func TestS3FIFO_EvictFromSmall_ReturnsFalse(t *testing.T) {
+	cache := newS3FIFO[int, int](&config{size: 100})
+
+	// Small queue is empty by default
+	result := cache.evictFromSmall()
+	if result {
+		t.Error("evictFromSmall should return false when queue is empty")
+	}
+}
+
+// TestS3FIFO_EvictionLoop_EmptyQueues tests the eviction loop when both queues are empty.
+func TestS3FIFO_EvictionLoop_EmptyQueues(t *testing.T) {
+	cache := newS3FIFO[int, int](&config{size: 10})
+
+	// Fill cache to trigger warmup completion
+	for i := range 10 {
+		cache.set(i, i, 0)
+	}
+
+	// Clear entries manually to create empty queue state
+	cache.mu.Lock()
+	for cache.small.len > 0 {
+		e := cache.small.head
+		cache.small.remove(e)
+		cache.entries.Delete(e.key)
+		cache.totalEntries.Add(-1)
+	}
+	for cache.main.len > 0 {
+		e := cache.main.head
+		cache.main.remove(e)
+		cache.entries.Delete(e.key)
+		cache.totalEntries.Add(-1)
+	}
+	cache.mu.Unlock()
+
+	// Now set a new item when capacity is exceeded but queues are empty
+	// This should hit the "else { break }" path in the eviction loop
+	cache.set(100, 100, 0)
+
+	if _, ok := cache.get(100); !ok {
+		t.Error("new item should be in cache")
+	}
+}
+
+// TestS3FIFO_SetWithHash_DoubleCheck tests the double-check path after lock.
+func TestS3FIFO_SetWithHash_DoubleCheck(t *testing.T) {
+	cache := newS3FIFO[int, int](&config{size: 100})
+
+	const key = 42
+	var wg sync.WaitGroup
+	var setCount atomic.Int32
+
+	// Multiple goroutines try to set the same key
+	for range 100 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			cache.set(key, 100, 0)
+			setCount.Add(1)
+		}()
+	}
+
+	wg.Wait()
+
+	// Key should exist
+	if val, ok := cache.get(key); !ok || val != 100 {
+		t.Errorf("get(%d) = %v, %v; want 100, true", key, val, ok)
+	}
+}
+
+// TestS3FIFO_SetNotFull tests setting when cache is not full (else branch).
+func TestS3FIFO_SetNotFull(t *testing.T) {
+	cache := newS3FIFO[int, int](&config{size: 100})
+
+	// Fill cache to capacity to trigger warmup
+	for i := range 100 {
+		cache.set(i, i, 0)
+	}
+
+	// Add one more to complete warmup (warmup completes when full=true)
+	cache.set(100, 100, 0)
+
+	// Verify warmup is complete
+	if !cache.warmupComplete {
+		t.Fatal("warmup should be complete after exceeding capacity")
+	}
+
+	// Delete entries to make cache not full
+	for i := range 60 {
+		cache.del(i)
+	}
+
+	// Verify cache is under capacity
+	if cache.totalEntries.Load() >= int64(cache.capacity) {
+		t.Fatalf("cache should be under capacity: %d >= %d", cache.totalEntries.Load(), cache.capacity)
+	}
+
+	// Now insert new entry - should hit the "else { ent.inSmall = true }" path
+	// because warmupComplete=true but full=false
+	cache.set(1000, 1000, 0)
+
+	if val, ok := cache.get(1000); !ok || val != 1000 {
+		t.Errorf("get(1000) = %v, %v; want 1000, true", val, ok)
+	}
+
+	// Verify the new entry went to small queue
+	if ent, ok := cache.getEntry(1000); ok {
+		if !ent.inSmall {
+			t.Error("new entry should be in small queue when cache not full")
+		}
+	}
 }

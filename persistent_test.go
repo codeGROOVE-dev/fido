@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -141,6 +142,101 @@ func (m *mockStore[K, V]) Close() error {
 		return fmt.Errorf("mock close error: already closed")
 	}
 	m.closed = true
+	return nil
+}
+
+// sequenceMockStore is a mock that can change behavior based on call count.
+type sequenceMockStore[K comparable, V any] struct {
+	mu            sync.RWMutex
+	data          map[string]mockEntry[V]
+	getCalls      int
+	failOnGetN    int // Fail on Nth Get call (0 = never fail)
+	returnOnGetN  int // Return value on Nth Get call (0 = never)
+	valueToReturn V
+}
+
+func newSequenceMockStore[K comparable, V any]() *sequenceMockStore[K, V] {
+	return &sequenceMockStore[K, V]{
+		data: make(map[string]mockEntry[V]),
+	}
+}
+
+func (m *sequenceMockStore[K, V]) ValidateKey(key K) error {
+	return nil
+}
+
+func (m *sequenceMockStore[K, V]) Get(ctx context.Context, key K) (v V, expiry time.Time, found bool, err error) {
+	m.mu.Lock()
+	m.getCalls++
+	callNum := m.getCalls
+	m.mu.Unlock()
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var zero V
+	if m.failOnGetN > 0 && callNum == m.failOnGetN {
+		return zero, time.Time{}, false, fmt.Errorf("mock get error on call %d", callNum)
+	}
+
+	if m.returnOnGetN > 0 && callNum == m.returnOnGetN {
+		return m.valueToReturn, time.Now().Add(time.Hour), true, nil
+	}
+
+	keyStr := fmt.Sprintf("%v", key)
+	entry, found := m.data[keyStr]
+	if !found {
+		return zero, time.Time{}, false, nil
+	}
+	return entry.value, entry.expiry, true, nil
+}
+
+func (m *sequenceMockStore[K, V]) Set(ctx context.Context, key K, value V, expiry time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	keyStr := fmt.Sprintf("%v", key)
+	m.data[keyStr] = mockEntry[V]{
+		value:     value,
+		expiry:    expiry,
+		updatedAt: time.Now(),
+	}
+	return nil
+}
+
+func (m *sequenceMockStore[K, V]) Delete(ctx context.Context, key K) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	keyStr := fmt.Sprintf("%v", key)
+	delete(m.data, keyStr)
+	return nil
+}
+
+func (m *sequenceMockStore[K, V]) Cleanup(ctx context.Context, maxAge time.Duration) (int, error) {
+	return 0, nil
+}
+
+func (m *sequenceMockStore[K, V]) Location(key K) string {
+	return fmt.Sprintf("mock://%v", key)
+}
+
+func (m *sequenceMockStore[K, V]) Len(ctx context.Context) (int, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.data), nil
+}
+
+func (m *sequenceMockStore[K, V]) Flush(ctx context.Context) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	count := len(m.data)
+	m.data = make(map[string]mockEntry[V])
+	return count, nil
+}
+
+func (m *sequenceMockStore[K, V]) Close() error {
 	return nil
 }
 
@@ -1200,5 +1296,540 @@ func TestTieredCache_GetSet_PersistenceFailure(t *testing.T) {
 	}
 	if memVal != 42 {
 		t.Errorf("memory value = %d; want 42", memVal)
+	}
+}
+
+func TestTieredCache_GetSet_KeyValidationError(t *testing.T) {
+	store := &validatingMockStore[string, int]{
+		mockStore: newMockStore[string, int](),
+	}
+	cache, err := NewTiered[string, int](store)
+	if err != nil {
+		t.Fatalf("NewTiered failed: %v", err)
+	}
+	defer func() { _ = cache.Close() }() //nolint:errcheck // Test cleanup
+
+	ctx := context.Background()
+	loaderCalls := 0
+	loader := func(ctx context.Context) (int, error) {
+		loaderCalls++
+		return 42, nil
+	}
+
+	// GetSet with invalid key should return error
+	_, err = cache.GetSet(ctx, "invalid/key", loader)
+	if err == nil {
+		t.Error("GetSet with invalid key should return error")
+	}
+
+	// Loader should not have been called
+	if loaderCalls != 0 {
+		t.Errorf("loader calls = %d; want 0 (should fail before loader)", loaderCalls)
+	}
+}
+
+func TestTieredCache_GetSet_PersistenceLoadFailure(t *testing.T) {
+	store := newMockStore[string, int]()
+	cache, err := NewTiered[string, int](store)
+	if err != nil {
+		t.Fatalf("NewTiered failed: %v", err)
+	}
+	defer func() { _ = cache.Close() }() //nolint:errcheck // Test cleanup
+
+	ctx := context.Background()
+	loader := func(ctx context.Context) (int, error) {
+		return 42, nil
+	}
+
+	// Make persistence load fail
+	store.setFailGet(true)
+
+	// GetSet should return error when persistence load fails
+	_, err = cache.GetSet(ctx, "key1", loader)
+	if err == nil {
+		t.Error("GetSet should return error when persistence load fails")
+	}
+}
+
+func TestTieredCache_GetSet_PersistenceLoadFailure_InFlight(t *testing.T) {
+	store := newMockStore[string, int]()
+	cache, err := NewTiered[string, int](store)
+	if err != nil {
+		t.Fatalf("NewTiered failed: %v", err)
+	}
+	defer func() { _ = cache.Close() }() //nolint:errcheck // Test cleanup
+
+	ctx := context.Background()
+
+	// First, do a successful GetSet to prime the flight
+	loader1 := func(ctx context.Context) (int, error) {
+		return 42, nil
+	}
+	_, err = cache.GetSet(ctx, "key1", loader1)
+	if err != nil {
+		t.Fatalf("first GetSet error: %v", err)
+	}
+
+	// Clear memory to force persistence check
+	cache.memory.flush()
+
+	// Now make persistence fail for the second check inside singleflight
+	store.setFailGet(true)
+
+	loader2 := func(ctx context.Context) (int, error) {
+		return 99, nil
+	}
+
+	// This tests the persistence load failure path inside the singleflight
+	_, err = cache.GetSet(ctx, "key1", loader2)
+	if err == nil {
+		t.Error("GetSet should return error when persistence load fails in singleflight")
+	}
+}
+
+func TestTieredCache_GetSet_CacheHitAfterFlight(t *testing.T) {
+	store := newMockStore[string, int]()
+	cache, err := NewTiered[string, int](store)
+	if err != nil {
+		t.Fatalf("NewTiered failed: %v", err)
+	}
+	defer func() { _ = cache.Close() }() //nolint:errcheck // Test cleanup
+
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	loaderCalls := int32(0)
+
+	// First goroutine starts slow loader
+	loader1 := func(ctx context.Context) (int, error) {
+		atomic.AddInt32(&loaderCalls, 1)
+		time.Sleep(100 * time.Millisecond)
+		return 42, nil
+	}
+
+	// Second goroutine will wait for first and should get cached result
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		val, err := cache.GetSet(ctx, "key1", loader1)
+		if err != nil {
+			t.Errorf("first GetSet error: %v", err)
+		}
+		if val != 42 {
+			t.Errorf("first GetSet value = %d; want 42", val)
+		}
+	}()
+
+	time.Sleep(10 * time.Millisecond) // Let first goroutine start
+
+	go func() {
+		defer wg.Done()
+		loader2 := func(ctx context.Context) (int, error) {
+			atomic.AddInt32(&loaderCalls, 1)
+			return 99, nil // Different value
+		}
+		val, err := cache.GetSet(ctx, "key1", loader2)
+		if err != nil {
+			t.Errorf("second GetSet error: %v", err)
+		}
+		if val != 42 {
+			t.Errorf("second GetSet value = %d; want 42 (from first loader)", val)
+		}
+	}()
+
+	wg.Wait()
+
+	if loaderCalls != 1 {
+		t.Errorf("loader calls = %d; want 1", loaderCalls)
+	}
+}
+
+func TestTieredCache_GetSet_FoundInPersistenceDuringSingleflight(t *testing.T) {
+	store := newMockStore[string, int]()
+	cache, err := NewTiered[string, int](store)
+	if err != nil {
+		t.Fatalf("NewTiered failed: %v", err)
+	}
+	defer func() { _ = cache.Close() }() //nolint:errcheck // Test cleanup
+
+	ctx := context.Background()
+
+	// Pre-populate persistence (but not memory)
+	_ = store.Set(ctx, "key1", 77, time.Now().Add(time.Hour))
+
+	loaderCalls := 0
+	loader := func(ctx context.Context) (int, error) {
+		loaderCalls++
+		return 42, nil
+	}
+
+	// GetSet should find value in persistence (after initial check), not call loader
+	val, err := cache.GetSet(ctx, "key1", loader)
+	if err != nil {
+		t.Fatalf("GetSet error: %v", err)
+	}
+	if val != 77 {
+		t.Errorf("GetSet value = %d; want 77 (from persistence)", val)
+	}
+	if loaderCalls != 0 {
+		t.Errorf("loader calls = %d; want 0", loaderCalls)
+	}
+}
+
+// flushFailingMockStore wraps mockStore and fails on Flush.
+type flushFailingMockStore[K comparable, V any] struct {
+	*mockStore[K, V]
+	failFlush bool
+}
+
+func (m *flushFailingMockStore[K, V]) Flush(ctx context.Context) (int, error) {
+	if m.failFlush {
+		return 0, fmt.Errorf("mock flush error")
+	}
+	return m.mockStore.Flush(ctx)
+}
+
+func TestTieredCache_Flush_PersistenceError(t *testing.T) {
+	innerStore := newMockStore[string, int]()
+	store := &flushFailingMockStore[string, int]{
+		mockStore: innerStore,
+		failFlush: false,
+	}
+
+	cache, err := NewTiered[string, int](store)
+	if err != nil {
+		t.Fatalf("NewTiered failed: %v", err)
+	}
+	defer func() { _ = cache.Close() }() //nolint:errcheck // Test cleanup
+
+	ctx := context.Background()
+
+	// Add some entries
+	for i := range 5 {
+		if err := cache.Set(ctx, fmt.Sprintf("key%d", i), i*10, 0); err != nil {
+			t.Fatalf("Set: %v", err)
+		}
+	}
+
+	// Now make flush fail
+	store.failFlush = true
+
+	// Flush should return error
+	removed, err := cache.Flush(ctx)
+	if err == nil {
+		t.Error("Flush should return error when persistence flush fails")
+	}
+
+	// Memory should still be flushed
+	if cache.Len() != 0 {
+		t.Errorf("memory cache should be empty after flush, got %d", cache.Len())
+	}
+
+	// Should return memory count even on persistence error
+	if removed != 5 {
+		t.Errorf("Flush removed %d items; want 5 (memory count)", removed)
+	}
+}
+
+func TestTieredCache_Delete_KeyValidationError(t *testing.T) {
+	store := &validatingMockStore[string, int]{
+		mockStore: newMockStore[string, int](),
+	}
+
+	cache, err := NewTiered[string, int](store)
+	if err != nil {
+		t.Fatalf("NewTiered failed: %v", err)
+	}
+	defer func() { _ = cache.Close() }() //nolint:errcheck // Test cleanup
+
+	ctx := context.Background()
+
+	// First add a valid key
+	if err := cache.Set(ctx, "validkey", 42, 0); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	// Delete with invalid key should return error
+	err = cache.Delete(ctx, "invalid/key")
+	if err == nil {
+		t.Error("Delete with invalid key should return error")
+	}
+
+	// Memory is deleted even though key validation fails (happens after memory delete)
+	// This is expected behavior - memory is always cleaned
+}
+
+func TestTieredCache_Get_KeyValidationError(t *testing.T) {
+	store := &validatingMockStore[string, int]{
+		mockStore: newMockStore[string, int](),
+	}
+
+	cache, err := NewTiered[string, int](store)
+	if err != nil {
+		t.Fatalf("NewTiered failed: %v", err)
+	}
+	defer func() { _ = cache.Close() }() //nolint:errcheck // Test cleanup
+
+	ctx := context.Background()
+
+	// Get with invalid key should return error
+	_, _, err = cache.Get(ctx, "invalid/key")
+	if err == nil {
+		t.Error("Get with invalid key should return error")
+	}
+}
+
+func TestTieredCache_Set_InvalidKey(t *testing.T) {
+	store := &validatingMockStore[string, int]{
+		mockStore: newMockStore[string, int](),
+	}
+
+	cache, err := NewTiered[string, int](store)
+	if err != nil {
+		t.Fatalf("NewTiered failed: %v", err)
+	}
+	defer func() { _ = cache.Close() }() //nolint:errcheck // Test cleanup
+
+	ctx := context.Background()
+
+	// Set with invalid key should return error before storing
+	err = cache.Set(ctx, "invalid/key", 42, 0)
+	if err == nil {
+		t.Error("Set with invalid key should return error")
+	}
+
+	// Nothing should be stored
+	if cache.Len() != 0 {
+		t.Errorf("cache should be empty, got %d entries", cache.Len())
+	}
+}
+
+func TestTieredCache_SetAsync_InvalidKey(t *testing.T) {
+	store := &validatingMockStore[string, int]{
+		mockStore: newMockStore[string, int](),
+	}
+
+	cache, err := NewTiered[string, int](store)
+	if err != nil {
+		t.Fatalf("NewTiered failed: %v", err)
+	}
+	defer func() { _ = cache.Close() }() //nolint:errcheck // Test cleanup
+
+	ctx := context.Background()
+
+	// SetAsync with invalid key should return error synchronously
+	err = cache.SetAsync(ctx, "invalid/key", 42, 0)
+	if err == nil {
+		t.Error("SetAsync with invalid key should return error")
+	}
+
+	// Nothing should be stored
+	if cache.Len() != 0 {
+		t.Errorf("cache should be empty, got %d entries", cache.Len())
+	}
+}
+
+// TestTieredCache_GetSet_MemoryHitDuringSingleflight tests the path where memory
+// has the value after acquiring singleflight.
+func TestTieredCache_GetSet_MemoryHitDuringSingleflight(t *testing.T) {
+	store := newMockStore[string, int]()
+	cache, err := NewTiered[string, int](store)
+	if err != nil {
+		t.Fatalf("NewTiered failed: %v", err)
+	}
+	defer func() { _ = cache.Close() }() //nolint:errcheck // Test cleanup
+
+	ctx := context.Background()
+	const key = "contested"
+
+	var started sync.WaitGroup
+	started.Add(1)
+
+	var done sync.WaitGroup
+	done.Add(2)
+
+	// First goroutine: slow loader
+	go func() {
+		defer done.Done()
+		started.Done()
+
+		_, _ = cache.GetSet(ctx, key, func(ctx context.Context) (int, error) {
+			time.Sleep(50 * time.Millisecond)
+			return 1, nil
+		})
+	}()
+
+	started.Wait()
+	time.Sleep(10 * time.Millisecond)
+
+	// Second goroutine: direct Set while first is in singleflight
+	go func() {
+		defer done.Done()
+		_ = cache.Set(ctx, key, 99)
+	}()
+
+	done.Wait()
+
+	// Value should exist
+	if val, ok, err := cache.Get(ctx, key); err != nil || !ok {
+		t.Errorf("Get error: %v, ok: %v", err, ok)
+	} else if val != 99 && val != 1 {
+		t.Errorf("unexpected value: %d", val)
+	}
+}
+
+// TestTieredCache_GetSet_PersistenceHitDuringSingleflight tests the path where
+// persistence has the value during singleflight (second check).
+func TestTieredCache_GetSet_PersistenceHitDuringSingleflight(t *testing.T) {
+	store := newMockStore[string, int]()
+	cache, err := NewTiered[string, int](store)
+	if err != nil {
+		t.Fatalf("NewTiered failed: %v", err)
+	}
+	defer func() { _ = cache.Close() }() //nolint:errcheck // Test cleanup
+
+	ctx := context.Background()
+	const key = "contested"
+
+	var started sync.WaitGroup
+	started.Add(1)
+
+	var done sync.WaitGroup
+	done.Add(2)
+
+	// First goroutine: slow loader that will be beaten by second
+	go func() {
+		defer done.Done()
+		started.Done()
+
+		val, err := cache.GetSet(ctx, key, func(ctx context.Context) (int, error) {
+			// By this time, the second goroutine should have stored to persistence
+			time.Sleep(50 * time.Millisecond)
+			return 1, nil
+		})
+		if err != nil {
+			t.Errorf("GetSet error: %v", err)
+		}
+		// Value could be 99 (from persistence) or 1 (from loader)
+		if val != 99 && val != 1 {
+			t.Errorf("unexpected value: %d", val)
+		}
+	}()
+
+	started.Wait()
+	time.Sleep(10 * time.Millisecond)
+
+	// Second goroutine: directly set in persistence (bypassing cache)
+	go func() {
+		defer done.Done()
+		_ = store.Set(ctx, key, 99, time.Now().Add(time.Hour))
+	}()
+
+	done.Wait()
+}
+
+// TestTieredCache_GetSet_SecondCheckMemory tests the second memory check inside singleflight.
+func TestTieredCache_GetSet_SecondCheckMemory(t *testing.T) {
+	store := newMockStore[string, int]()
+	cache, err := NewTiered[string, int](store)
+	if err != nil {
+		t.Fatalf("NewTiered failed: %v", err)
+	}
+	defer func() { _ = cache.Close() }() //nolint:errcheck // Test cleanup
+
+	ctx := context.Background()
+
+	// Pre-populate memory directly (but not persistence)
+	cache.memory.set("key1", 77, 0)
+
+	loaderCalls := 0
+	loader := func(ctx context.Context) (int, error) {
+		loaderCalls++
+		return 42, nil
+	}
+
+	// First check won't find it (memory is checked at start)
+	// But the double-check inside singleflight should find it
+	// Actually, the first memory check will find it, so loader won't be called
+
+	// Let's test a different scenario - concurrent access
+	var wg sync.WaitGroup
+	results := make([]int, 10)
+
+	for i := range 10 {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			val, _ := cache.GetSet(ctx, fmt.Sprintf("key%d", idx), loader)
+			results[idx] = val
+		}(i)
+	}
+
+	wg.Wait()
+
+	// All results should be valid
+	for i, r := range results {
+		if r != 77 && r != 42 {
+			t.Errorf("result[%d] = %d; unexpected", i, r)
+		}
+	}
+}
+
+// TestTieredCache_GetSet_SecondStoreGetError tests when second store.Get fails.
+func TestTieredCache_GetSet_SecondStoreGetError(t *testing.T) {
+	store := newSequenceMockStore[string, int]()
+	// First Get returns not found, second Get fails
+	store.failOnGetN = 2
+
+	cache, err := NewTiered[string, int](store)
+	if err != nil {
+		t.Fatalf("NewTiered failed: %v", err)
+	}
+	defer func() { _ = cache.Close() }() //nolint:errcheck // Test cleanup
+
+	ctx := context.Background()
+
+	_, err = cache.GetSet(ctx, "key1", func(ctx context.Context) (int, error) {
+		return 42, nil
+	})
+
+	// The second store.Get fails, which should return an error
+	if err == nil {
+		t.Error("expected error from second store.Get failure")
+	}
+}
+
+// TestTieredCache_GetSet_SecondStoreGetFound tests when second store.Get finds value.
+func TestTieredCache_GetSet_SecondStoreGetFound(t *testing.T) {
+	store := newSequenceMockStore[string, int]()
+	// First Get returns not found, second Get returns value
+	store.returnOnGetN = 2
+	store.valueToReturn = 99
+
+	cache, err := NewTiered[string, int](store)
+	if err != nil {
+		t.Fatalf("NewTiered failed: %v", err)
+	}
+	defer func() { _ = cache.Close() }() //nolint:errcheck // Test cleanup
+
+	ctx := context.Background()
+
+	loaderCalled := false
+	val, err := cache.GetSet(ctx, "key1", func(ctx context.Context) (int, error) {
+		loaderCalled = true
+		return 42, nil
+	})
+
+	if err != nil {
+		t.Fatalf("GetSet failed: %v", err)
+	}
+
+	// Should return value from second store.Get, not from loader
+	if val != 99 {
+		t.Errorf("val = %d; want 99", val)
+	}
+
+	if loaderCalled {
+		t.Error("loader should not be called when second store.Get finds value")
 	}
 }

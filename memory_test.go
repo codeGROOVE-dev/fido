@@ -660,3 +660,324 @@ func TestCache_CapacityEfficiency_StringKeys(t *testing.T) {
 		})
 	}
 }
+
+func TestCache_SetIfAbsent_Basic(t *testing.T) {
+	cache := New[string, int]()
+	defer cache.Close()
+
+	// SetIfAbsent on missing key should insert
+	val, existed := cache.SetIfAbsent("key1", 42)
+	if existed {
+		t.Error("key1 should not have existed")
+	}
+	if val != 42 {
+		t.Errorf("SetIfAbsent returned %d; want 42", val)
+	}
+
+	// Verify it was stored
+	got, found := cache.Get("key1")
+	if !found || got != 42 {
+		t.Errorf("Get after SetIfAbsent: got %d, found %v; want 42, true", got, found)
+	}
+
+	// SetIfAbsent on existing key should return existing value
+	val, existed = cache.SetIfAbsent("key1", 100)
+	if !existed {
+		t.Error("key1 should have existed")
+	}
+	if val != 42 {
+		t.Errorf("SetIfAbsent returned %d; want 42 (original value)", val)
+	}
+
+	// Verify value unchanged
+	got, found = cache.Get("key1")
+	if !found || got != 42 {
+		t.Errorf("Get after second SetIfAbsent: got %d, found %v; want 42, true", got, found)
+	}
+}
+
+func TestCache_SetIfAbsent_WithTTL(t *testing.T) {
+	cache := New[string, int](TTL(time.Hour))
+	defer cache.Close()
+
+	// SetIfAbsent with explicit TTL
+	val, existed := cache.SetIfAbsent("key1", 42, 50*time.Millisecond)
+	if existed {
+		t.Error("key1 should not have existed")
+	}
+	if val != 42 {
+		t.Errorf("SetIfAbsent returned %d; want 42", val)
+	}
+
+	// Value should be available immediately
+	if _, found := cache.Get("key1"); !found {
+		t.Error("key1 should be found immediately after SetIfAbsent")
+	}
+
+	// Wait for TTL to expire
+	time.Sleep(100 * time.Millisecond)
+
+	// Value should be expired
+	if _, found := cache.Get("key1"); found {
+		t.Error("key1 should be expired")
+	}
+}
+
+func TestCache_SetIfAbsent_NoTTL(t *testing.T) {
+	cache := New[string, int]() // No default TTL
+	defer cache.Close()
+
+	// SetIfAbsent without TTL on cache with no default
+	val, existed := cache.SetIfAbsent("key1", 42)
+	if existed {
+		t.Error("key1 should not have existed")
+	}
+	if val != 42 {
+		t.Errorf("SetIfAbsent returned %d; want 42", val)
+	}
+
+	// Value should persist indefinitely (no expiry)
+	time.Sleep(50 * time.Millisecond)
+	if _, found := cache.Get("key1"); !found {
+		t.Error("key1 should still exist (no TTL)")
+	}
+}
+
+func TestCache_SetIfAbsent_Concurrent(t *testing.T) {
+	cache := New[int, int](Size(1000))
+	defer cache.Close()
+
+	var wg sync.WaitGroup
+	existedCount := atomic.Int32{}
+	notExistedCount := atomic.Int32{}
+
+	// Many goroutines try to SetIfAbsent the same key
+	for range 100 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, existed := cache.SetIfAbsent(42, 100)
+			if existed {
+				existedCount.Add(1)
+			} else {
+				notExistedCount.Add(1)
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	// At least some should have seen it as existing (not all created it)
+	// SetIfAbsent is not fully atomic (get then set), so multiple may "win"
+	if existedCount.Load() < 50 {
+		t.Errorf("existedCount = %d; want >= 50 (most should see existing)", existedCount.Load())
+	}
+
+	// Final value should be 100
+	if val, found := cache.Get(42); !found || val != 100 {
+		t.Errorf("Get(42) = %d, %v; want 100, true", val, found)
+	}
+
+	t.Logf("existedCount = %d, notExistedCount = %d", existedCount.Load(), notExistedCount.Load())
+}
+
+func TestCache_Close_NoOp(t *testing.T) {
+	cache := New[string, int]()
+
+	// Close should be a no-op for in-memory cache
+	cache.Close()
+
+	// Multiple closes should be safe
+	cache.Close()
+	cache.Close()
+}
+
+func TestCache_GetSet_CacheHitDuringSingleflight(t *testing.T) {
+	cache := New[string, int](Size(1000))
+	defer cache.Close()
+
+	var wg sync.WaitGroup
+	loaderCalls := atomic.Int32{}
+
+	// Start first loader that's slow
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, _ = cache.GetSet("key1", func() (int, error) {
+			loaderCalls.Add(1)
+			// While loader is running, another goroutine populates cache
+			time.Sleep(100 * time.Millisecond)
+			return 42, nil
+		})
+	}()
+
+	// Let first goroutine start and enter singleflight
+	time.Sleep(10 * time.Millisecond)
+
+	// While first is waiting, directly set the value in cache
+	cache.Set("key1", 99)
+
+	// Start second loader that should wait for first
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		val, _ := cache.GetSet("key1", func() (int, error) {
+			loaderCalls.Add(1)
+			return 77, nil
+		})
+		// Second should get either 99 (from cache) or 42 (from first loader)
+		if val != 99 && val != 42 {
+			t.Errorf("unexpected value: %d", val)
+		}
+	}()
+
+	wg.Wait()
+
+	t.Logf("loader calls: %d", loaderCalls.Load())
+}
+
+func TestCache_GetSet_RaceCondition(t *testing.T) {
+	// Test the path where cache is populated between first check and singleflight
+	cache := New[string, int](Size(1000))
+	defer cache.Close()
+
+	var wg sync.WaitGroup
+
+	// Run many concurrent GetSets with a mix of slow and fast loaders
+	for i := range 20 {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			key := fmt.Sprintf("key%d", idx%5) // Only 5 unique keys
+
+			val, err := cache.GetSet(key, func() (int, error) {
+				if idx%3 == 0 {
+					time.Sleep(10 * time.Millisecond)
+				}
+				return idx * 10, nil
+			})
+
+			if err != nil {
+				t.Errorf("GetSet error: %v", err)
+			}
+			if val < 0 {
+				t.Errorf("unexpected value: %d", val)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+}
+
+// TestCache_GetSet_MemoryHitAfterSingleflightAcquire tests the path where
+// the cache is populated between winning singleflight and checking cache again.
+func TestCache_GetSet_MemoryHitAfterSingleflightAcquire(t *testing.T) {
+	// This is tricky to test because the window is very small.
+	// We use a contrived scenario with concurrent access.
+	cache := New[string, int](Size(100))
+	defer cache.Close()
+
+	// Key that will be set by another goroutine
+	const key = "contested"
+
+	var started sync.WaitGroup
+	started.Add(1)
+
+	var done sync.WaitGroup
+	done.Add(2)
+
+	// First goroutine: slow loader
+	go func() {
+		defer done.Done()
+		started.Done() // Signal that we've started
+
+		_, _ = cache.GetSet(key, func() (int, error) {
+			// Wait long enough for the second Set to happen
+			time.Sleep(50 * time.Millisecond)
+			return 1, nil
+		})
+	}()
+
+	// Wait for first goroutine to start
+	started.Wait()
+	time.Sleep(5 * time.Millisecond)
+
+	// Second goroutine: direct Set while first is in loader
+	go func() {
+		defer done.Done()
+		cache.Set(key, 99)
+	}()
+
+	done.Wait()
+
+	// Value should be either 99 (from Set) or 1 (from loader)
+	if val, ok := cache.Get(key); !ok {
+		t.Error("key should exist")
+	} else if val != 99 && val != 1 {
+		t.Errorf("unexpected value: %d", val)
+	}
+}
+
+// TestCache_GetSet_WithDefaultTTL tests GetSet using the default TTL.
+func TestCache_GetSet_WithDefaultTTL(t *testing.T) {
+	cache := New[string, int](TTL(time.Hour))
+	defer cache.Close()
+
+	val, err := cache.GetSet("key1", func() (int, error) {
+		return 42, nil
+	})
+
+	if err != nil {
+		t.Fatalf("GetSet error: %v", err)
+	}
+	if val != 42 {
+		t.Errorf("GetSet value = %d; want 42", val)
+	}
+}
+
+// TestCache_GetSet_DoubleCheckPath attempts to hit the double-check cache hit path.
+// This path is triggered when:
+// 1. First check misses (no cache hit)
+// 2. We win the singleflight (not loaded)
+// 3. Another call populated the cache before our double-check
+// 4. Double-check finds the value
+func TestCache_GetSet_DoubleCheckPath(t *testing.T) {
+	var hitCount int
+	for iteration := range 1000 {
+		cache := New[string, int](Size(100))
+
+		key := fmt.Sprintf("key%d", iteration)
+		var loaderCalled atomic.Bool
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		// Goroutine 1: Will try to win singleflight
+		go func() {
+			defer wg.Done()
+			_, _ = cache.GetSet(key, func() (int, error) {
+				loaderCalled.Store(true)
+				return 1, nil
+			})
+		}()
+
+		// Goroutine 2: Directly sets value, racing with goroutine 1
+		go func() {
+			defer wg.Done()
+			cache.Set(key, 99)
+		}()
+
+		wg.Wait()
+		cache.Close()
+
+		// If loader wasn't called, we hit the double-check path
+		if !loaderCalled.Load() {
+			hitCount++
+		}
+	}
+	if hitCount > 0 {
+		t.Logf("Hit double-check path %d times out of 1000", hitCount)
+	} else {
+		t.Log("Could not reliably hit double-check path (race dependent)")
+	}
+}
