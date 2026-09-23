@@ -516,12 +516,12 @@ func (c *s3fifo[K, V]) get(key K) (V, bool) {
 // resurrectFromDeathRow brings an entry back from pending eviction.
 // Resurrected items go to main queue with freq=3 to protect them from immediate re-eviction.
 //
-// NOTE: Uses manual unlock instead of defer for -6% throughput improvement on hot path.
+// Always release the writer lock if a caller recovers an eviction panic.
 func (c *s3fifo[K, V]) resurrectFromDeathRow(key K) (V, bool) {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	ent, ok := c.entries.Load(key)
 	if !ok || !ent.onDeathRow() {
-		c.mu.Unlock()
 		var zero V
 		return zero, ok
 	}
@@ -547,7 +547,6 @@ func (c *s3fifo[K, V]) resurrectFromDeathRow(key K) (V, bool) {
 	}
 
 	val, ok := ent.loadValue()
-	c.mu.Unlock()
 	return val, ok
 }
 
@@ -576,7 +575,7 @@ func (*s3fifo[K, V]) updateEntry(ent *entry[K, V], value V, expirySec uint32) {
 
 // setWithHash adds or updates a value. hash=0 means compute when needed.
 //
-// NOTE: Uses manual unlock instead of defer for -5% throughput improvement on hot path.
+// Always release the writer lock if a caller recovers an insertion panic.
 func (c *s3fifo[K, V]) setWithHash(key K, value V, expirySec uint32, hash uint64) {
 	// Fast path: lock-free update for existing entries.
 	if ent, exists := c.entries.Load(key); exists {
@@ -586,11 +585,11 @@ func (c *s3fifo[K, V]) setWithHash(key K, value V, expirySec uint32, hash uint64
 
 	// Slow path: need lock for new entry insertion.
 	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	// Double-check after acquiring lock.
 	if ent, exists := c.entries.Load(key); exists {
 		c.updateEntry(ent, value, expirySec)
-		c.mu.Unlock()
 		return
 	}
 
@@ -621,7 +620,6 @@ func (c *s3fifo[K, V]) setWithHash(key K, value V, expirySec uint32, hash uint64
 		c.small.pushBack(ent)
 		c.entries.Store(key, ent)
 		c.totalEntries.Add(1)
-		c.mu.Unlock()
 		return
 	}
 	c.warmupComplete = true
@@ -652,7 +650,6 @@ func (c *s3fifo[K, V]) setWithHash(key K, value V, expirySec uint32, hash uint64
 
 	c.entries.Store(key, ent)
 	c.totalEntries.Add(1)
-	c.mu.Unlock()
 }
 
 func (c *s3fifo[K, V]) del(key K) {
@@ -664,14 +661,26 @@ func (c *s3fifo[K, V]) del(key K) {
 		return
 	}
 
-	if ent.inSmall() {
-		c.small.remove(ent)
+	if ent.onDeathRow() {
+		// Pending entries are still in the map, but have already left both
+		// FIFOs and the live count. Unlinking one again corrupts the list
+		// (a nil head with a positive length), making the next eviction panic.
+		for i, pending := range c.deathRow {
+			if pending == ent {
+				c.deathRow[i] = nil
+				break
+			}
+		}
+		ent.setOnDeathRow(false)
 	} else {
-		c.main.remove(ent)
+		if ent.inSmall() {
+			c.small.remove(ent)
+		} else {
+			c.main.remove(ent)
+		}
+		c.totalEntries.Add(-1)
 	}
-
 	c.entries.Delete(key)
-	c.totalEntries.Add(-1)
 }
 
 // addToGhost records an evicted key's hash for future admission decisions.
