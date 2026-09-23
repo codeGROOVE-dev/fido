@@ -103,3 +103,27 @@ fido has been hyper-tuned for high performance, and deviates from the original p
 ## License
 
 Apache 2.0
+
+### Memory diagnostics
+
+`Cache.MemoryStats` and `TieredCache.MemoryStats` sample the memory tier:
+
+```go
+stats, ok := cache.MemoryStats(func(key string, value []byte) uint64 {
+    return uint64(len(key) + cap(value))
+})
+if ok {
+    log.Printf("entries=%d capacity=%d pending=%d estimated_bytes=%d",
+        stats.Entries, stats.Capacity, stats.PendingEntries, stats.Bytes())
+}
+```
+
+The callback estimates referenced storage beyond the inline key/value headers.
+Use `nil` for structural accounting only. Sampling includes expired entries and
+entries pending eviction because they still retain memory. It takes O(N) time;
+run it periodically and retain the last sample when `ok` is false (writer busy).
+The full scan and callback run without the FIFO writer lock. Counts and bytes
+are approximate under concurrent changes, and shared backing storage may be
+counted more than once. Estimates exclude allocator rounding, xsync map/lock
+internals, in-flight loads and process overhead. Use Go heap profiles for an
+independent measurement. This method never contacts a persistent Store.
