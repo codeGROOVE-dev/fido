@@ -71,3 +71,24 @@ func TestS3FIFO_InsertionPanicReleasesLock(t *testing.T) {
 	}
 	c.mu.Unlock()
 }
+
+// Reproduce the production failure using public operations only: retain a
+// once-read entry during eviction, invalidate it, then keep inserting.
+func TestCacheDeleteAfterEviction(t *testing.T) {
+	c := New[int, int](Size(8))
+	for i := 0; i < 8; i++ {
+		c.Set(i, i)
+	}
+	c.Get(0)
+	c.Set(8, 8)
+	c.Delete(0)
+	if c.Len() != 8 {
+		t.Fatalf("deleting an evicted entry changed live count to %d", c.Len())
+	}
+	for i := 9; i < 100; i++ {
+		c.Set(i, i)
+	}
+	if got, ok := c.Get(99); !ok || got != 99 {
+		t.Fatalf("cache stopped after invalidation: %d %v", got, ok)
+	}
+}
